@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# uv / tooling
+.uv-cache/
+.uv-python/
+
+# Runtime logs & debug scratch dirs
+.logs/
+.tmp/
+.tmp-*/
+
+# Imported data & runtime state (never commit)
+data/raw/
+data/parquet/
+data/meta/
+data/segments/
+data/staging/
+data/tmp/
+data/jobs.sqlite3*
+data/*.csv
+data/*.xlsx
+data/*.db
+
+# Optional large-scale backends
+clickhouse_data/
+clickhouse_logs/
+postgres_data/

@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: pid
+      POSTGRES_USER: pid
+      POSTGRES_PASSWORD: ${PID_POSTGRES_PASSWORD:?Set PID_POSTGRES_PASSWORD before starting}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pid -d pid"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+  pid-web:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      PID_DATA_DIR: /app/data
+      PID_STORAGE_BACKEND: postgres
+      PID_POSTGRES_HOST: postgres
+      PID_POSTGRES_PORT: 5432
+      PID_POSTGRES_DATABASE: pid
+      PID_POSTGRES_USER: pid
+      PID_POSTGRES_PASSWORD: ${PID_POSTGRES_PASSWORD:?Set PID_POSTGRES_PASSWORD before starting}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy

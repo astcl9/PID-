@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PID 年度数据可视化</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="/static/vendor/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">∿</span><div><strong>PID 数据可视化</strong><small>年度运行分析工作台</small></div></div>
+    <div class="top-actions"><span id="apiStatus" class="status-dot offline">API 未连接</span><button id="refreshBtn" class="ghost">刷新</button></div>
+  </header>
+
+  <main class="shell">
+    <aside class="sidebar">
+      <section class="card upload-card">
+        <h3>导入数据</h3><p class="muted">支持 CSV、Excel；大文件会在后台分块解析</p>
+        <label class="dropzone" id="dropzone"><input id="fileInput" type="file" accept=".csv,.xlsx,.xls" /><span class="upload-icon">↑</span><span>拖拽文件到此处，或点击选择</span><small id="fileName">尚未选择文件</small></label>
+        <button id="uploadBtn" class="primary full" disabled>开始导入</button>
+        <div id="uploadProgress" class="progress hidden"><div></div></div><div id="uploadMessage" class="hint"></div>
+      </section>
+      <section class="card">
+        <h3>数据集</h3><select id="datasetSelect"><option value="">选择数据集…</option></select><div id="datasetMeta" class="dataset-meta">请选择数据集</div>
+      </section>
+      <section class="card filters">
+        <h3>筛选</h3><label>年份<select id="yearSelect"></select></label><label>回路<select id="loopSelect"><option value="">全部回路</option></select></label>
+        <div class="check-title">变量</div><div class="checks"><label><input type="checkbox" value="PV" checked> PV</label><label><input type="checkbox" value="SV" checked> SV / SP</label><label><input type="checkbox" value="MV" checked> MV</label></div>
+      </section>
+      <section class="card mapping-card">
+        <h3>信号映射</h3><p class="muted">修正类型，并可保存单位和备注</p>
+        <div id="signalMappingList" class="mapping-list"><span class="muted">请先选择数据集</span></div>
+        <button id="saveSignalMappings" class="ghost full" disabled>保存映射</button>
+      </section>
+    </aside>
+
+    <section class="content">
+      <div class="page-head"><div><h1>年度概览</h1><p id="rangeLabel" class="muted">选择数据集查看全年运行情况</p></div><div class="view-switch"><button class="tab active" data-view="year">年度</button><button class="tab" data-view="day">单日</button></div></div>
+      <div id="yearView">
+        <div class="metric-row"><div class="metric"><span>数据覆盖天数</span><strong id="daysMetric">—</strong></div><div class="metric"><span>平均完整率</span><strong id="coverageMetric">—</strong></div><div class="metric"><span>智能分段</span><strong id="segmentsMetric">—</strong></div><div class="metric"><span>异常日期</span><strong id="alertsMetric">—</strong></div></div>
+        <section class="card calendar-card"><div class="section-head"><h2 id="calendarTitle">运行日历</h2><span class="legend"><i class="ok"></i>完整 <i class="warn"></i>有异常 <i class="empty"></i>无数据</span></div><div id="calendar" class="calendar"></div></section>
+        <section class="card"><div class="section-head"><h2>年度趋势</h2><span class="muted">每日平均 PV-SV 偏差与 MV 波动率</span></div><div id="yearChart" class="chart small-chart"></div></section>
+      </div>
+      <div id="dayView" class="hidden">
+        <div class="day-toolbar card"><label>日期<input id="dateInput" type="date" /></label><label>分辨率<select id="resolutionSelect"><option value="1m">1 分钟</option><option value="10s">10 秒</option><option value="raw">原始</option></select></label><button id="todayBtn" class="ghost">回到今天</button><button id="exportBtn" class="primary">导出当前视图</button></div>
+        <div class="time-navigator card"><div class="time-navigator-head"><strong>日内时间窗口</strong><span id="windowLabel" class="muted">全天</span></div><div class="time-navigator-row"><span class="time-mark">00:00</span><input id="windowStartSlider" type="range" min="0" max="0" step="1" value="0" aria-label="窗口起始时间" /><span class="time-mark">24:00</span></div><div class="time-navigator-actions"><label>窗口长度<select id="windowDuration"><option value="1440">全天</option><option value="360">6 小时</option><option value="180">3 小时</option><option value="60">1 小时</option><option value="30">30 分钟</option><option value="15">15 分钟</option></select></label><button id="windowBack" class="ghost">上一窗口</button><button id="windowForward" class="ghost">下一窗口</button><button id="windowFull" class="ghost">显示全天</button></div></div>
+        <section class="card"><div class="section-head"><h2 id="dayTitle">单日曲线</h2><span id="dayHint" class="muted"></span></div><div id="dayChart" class="chart day-chart"></div></section>
+        <section class="card"><div class="section-head"><h2>智能分段</h2><div><span class="muted">点击分段查看区间统计</span> <button id="segmentExportBtn" class="ghost">导出分段</button></div></div><div id="segmentTimeline" class="timeline"></div><div id="segmentStats" class="segment-stats muted">请选择一个分段</div><div id="segmentTable" class="segment-table"></div></section>
+      </div>
+      <div id="toast" class="toast"></div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
