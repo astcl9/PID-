@@ -1,3 +1,7 @@
+import time
+
+import pandas as pd
+
 from app import jobs
 
 
@@ -45,3 +49,29 @@ def test_job_summary_counts_persisted_states(tmp_path, monkeypatch):
 
     assert summary["completed"] == 2
     assert summary["failed"] == 1
+
+
+def test_concurrent_imports_run_to_completion(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobs, "DATA_DIR", tmp_path / "data")
+    jobs._jobs.clear()
+
+    sources = []
+    for idx in range(2):
+        source = tmp_path / f"history-{idx}.csv"
+        pd.DataFrame({
+            "timestamp": pd.date_range("2026-01-01", periods=12, freq="min"),
+            "A.PV": range(12),
+            "A.SV": [5] * 12,
+            "A.MV": [20] * 12,
+        }).to_csv(source, index=False)
+        sources.append(source)
+
+    job_ids = [jobs.create_job(src, f"ds-{idx}", src.name) for idx, src in enumerate(sources)]
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if all(jobs.get_job(jid)["status"] == "completed" for jid in job_ids):
+            break
+        time.sleep(0.05)
+
+    assert [jobs.get_job(jid)["status"] for jid in job_ids] == ["completed", "completed"]

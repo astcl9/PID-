@@ -4,6 +4,7 @@ import os
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.getenv("PID_DATA_DIR", BASE_DIR / "data"))
 MAX_UPLOAD_MB = int(os.getenv("PID_MAX_UPLOAD_MB", "2048"))
+IMPORT_WORKERS = max(1, int(os.getenv("PID_IMPORT_WORKERS", "2")))
 HOST = os.getenv("PID_HOST", "0.0.0.0")
 PORT = int(os.getenv("PID_PORT", "8080"))
 STORAGE_BACKEND = os.getenv("PID_STORAGE_BACKEND", os.getenv("PID_STORAGE", "parquet")).lower()

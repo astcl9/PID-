@@ -69,3 +69,25 @@ def test_wide_import_skips_memory_heavy_global_sort_with_warning(tmp_path, monke
     assert metadata["rows"] == 160
     assert any("超过全量去重阈值" in warning for warning in metadata["warnings"])
     assert (tmp_path / "data" / "parquet" / "dataset-wide" / "date=2026-01-01" / "data.parquet").exists()
+
+
+def test_parquet_write_compression_is_configurable(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+    from app import importer
+
+    # Skip the DuckDB compaction pass so this exercises the chunked write path
+    # (the one large files rely on) directly.
+    monkeypatch.setenv("PID_MAX_DEDUPE_ROWS", "1")
+    monkeypatch.setattr(importer, "PARQUET_COMPRESSION", "gzip")
+
+    source = tmp_path / "history.csv"
+    pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=6, freq="min"),
+        "A.PV": range(6),
+    }).to_csv(source, index=False)
+
+    root = tmp_path / "data"
+    import_dataset(source, "dataset-gzip", source.name, data_dir=root)
+    path = root / "parquet" / "dataset-gzip" / "date=2026-01-01" / "data.parquet"
+    codec = pq.ParquetFile(path).metadata.row_group(0).column(0).compression
+    assert codec.upper() == "GZIP"

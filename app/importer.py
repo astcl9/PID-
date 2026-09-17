@@ -17,6 +17,19 @@ TYPE_RE = {
     "mv": re.compile(r"(?:^|[._\- ])mv(?:$|[._\- ])", re.I),
 }
 
+# Codec used when writing day-partitioned Parquet.  snappy compresses and
+# decompresses much faster than the previous zstd default at the cost of a
+# larger file, which matters most for large imports.  Override with
+# PID_PARQUET_COMPRESSION (snappy|zstd|gzip|none).
+PARQUET_COMPRESSION = os.getenv("PID_PARQUET_COMPRESSION", "snappy").strip().lower() or "snappy"
+
+
+def _duckdb_compression() -> str:
+    """Map the configured codec to DuckDB's COPY COMPRESSION keyword."""
+    if PARQUET_COMPRESSION in {"none", "uncompressed"}:
+        return "UNCOMPRESSED"
+    return PARQUET_COMPRESSION.upper()
+
 
 def detect_csv_encoding(path: Path, sample_size: int = 64 * 1024) -> str:
     """Detect common CSV encodings from a bounded byte prefix.
@@ -106,13 +119,42 @@ def classify_signal(name: str) -> str:
             return "SV" if kind == "sp" else kind.upper()
     return "other"
 
+
+_TIMESTAMP_ALIASES = {
+    "timestamp", "time", "datetime", "date",
+    "时间", "时间戳", "日期", "日期时间", "采样时间", "记录时间", "时刻",
+}
+_INDEX_ALIASES = {"index", "idx", "序号", "行号", "编号"}
+
+
+def _normalise_column_name(name) -> str:
+    return str(name).lstrip("\ufeff").strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+
+
+def _is_index_column(name) -> bool:
+    return _normalise_column_name(name) in _INDEX_ALIASES
+
+
 def detect_timestamp(df: pd.DataFrame) -> str:
-    preferred = [c for c in df.columns if str(c).lower() in {"timestamp", "time", "datetime", "date"}]
+    preferred = [c for c in df.columns if _normalise_column_name(c) in _TIMESTAMP_ALIASES]
     if preferred:
         return preferred[0]
+
+    # Integer sequence columns (a common first column in plant exports) are
+    # interpreted by pandas as nanoseconds since 1970.  Never use a numeric
+    # column as a fallback timestamp candidate unless it has an explicit
+    # timestamp-like header above.
     for c in df.columns:
-        parsed = pd.to_datetime(df[c], errors="coerce")
-        if parsed.notna().mean() > 0.8:
+        values = df[c].dropna()
+        if values.empty or pd.api.types.is_numeric_dtype(values):
+            continue
+        text = values.astype("string").str.strip()
+        numeric_like = pd.to_numeric(text, errors="coerce").notna().mean()
+        if numeric_like > 0.8:
+            continue
+        parsed = pd.to_datetime(text, errors="coerce")
+        valid = parsed.notna()
+        if valid.mean() > 0.8 and parsed.loc[valid].dt.year.between(1900, 2100).mean() > 0.8:
             return c
     raise ValueError("未找到可识别的时间列")
 
@@ -142,7 +184,7 @@ def normalize_file(path: Path, dataset_id: str | None = None) -> tuple[str, pd.D
         source = source.drop_duplicates("timestamp", keep="last")
     rows = []
     for col in source.columns:
-        if col in {tcol, "timestamp"}:
+        if col in {tcol, "timestamp"} or _is_index_column(col):
             continue
         val = pd.to_numeric(source[col], errors="coerce")
         if val.notna().sum() == 0:
@@ -206,23 +248,30 @@ def _normalise_chunk(chunk: pd.DataFrame, dataset_id: str, timestamp_col: str,
     timestamps = raw_ts.dt.tz_localize(None)
     work = chunk.loc[valid].copy()
     work["timestamp"] = timestamps.loc[valid].to_numpy()
-    signal_cols = [c for c in work.columns if c not in {timestamp_col, "timestamp"}]
-    records = []
-    for col in signal_cols:
-        values = pd.to_numeric(work[col], errors="coerce")
-        if values.notna().sum() == 0:
-            continue
-        records.append(pd.DataFrame({
-            "dataset_id": dataset_id,
-            "timestamp": work["timestamp"].to_numpy(),
-            "tag": str(col),
-            "type": classify_signal(col),
-            "value": values.astype("float64").to_numpy(),
-            "quality": values.notna().map({True: "good", False: "missing"}).to_numpy(),
-            "unit": None,
-            "_ingest_seq": range(seq_start, seq_start + len(work)),
-        }))
-    out = pd.concat(records, ignore_index=True) if records else pd.DataFrame()
+    signal_cols = [c for c in work.columns if c not in {timestamp_col, "timestamp"} and not _is_index_column(c)]
+    if not signal_cols:
+        return pd.DataFrame(), seq_start + len(chunk), warnings
+
+    # Convert the whole signal block and melt once.  The previous per-column
+    # loop created hundreds of DataFrames for every tiny wide-file chunk,
+    # making large imports needlessly CPU-bound.
+    numeric = work[signal_cols].apply(pd.to_numeric, errors="coerce")
+    numeric = numeric.loc[:, numeric.notna().any(axis=0)]
+    if numeric.empty:
+        return pd.DataFrame(), seq_start + len(chunk), warnings
+    long = numeric.assign(
+        timestamp=work["timestamp"].to_numpy(),
+        _ingest_seq=range(seq_start, seq_start + len(work)),
+    ).melt(
+        id_vars=["timestamp", "_ingest_seq"],
+        var_name="tag",
+        value_name="value",
+    )
+    long["dataset_id"] = dataset_id
+    long["type"] = long["tag"].map(classify_signal)
+    long["quality"] = long["value"].notna().map({True: "good", False: "missing"})
+    long["unit"] = None
+    out = long[["dataset_id", "timestamp", "tag", "type", "value", "quality", "unit", "_ingest_seq"]]
     return out, seq_start + len(chunk), warnings
 
 
@@ -280,7 +329,7 @@ def _append_parquet_by_day(out: pd.DataFrame, root: Path, dataset_id: str, write
         table = pa.Table.from_pandas(part, preserve_index=False)
         writer = writers.get(dstr)
         if writer is None:
-            writer = pq.ParquetWriter(target, table.schema, compression="zstd")
+            writer = pq.ParquetWriter(target, table.schema, compression=PARQUET_COMPRESSION)
             writers[dstr] = writer
         writer.write_table(table)
         stamp = pd.to_datetime(part["timestamp"])
@@ -323,7 +372,7 @@ def _compact_day_partitions(root: Path, dataset_id: str, days) -> dict[str, tupl
                         ORDER BY _ingest_seq DESC
                     ) = 1
                     ORDER BY timestamp, tag
-                ) TO '{compacted_sql}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                ) TO '{compacted_sql}' (FORMAT PARQUET, COMPRESSION {_duckdb_compression()})
             """)
             compacted.replace(target)
             count, lo, hi = con.execute(
@@ -359,7 +408,12 @@ def import_dataset(path, dataset_id, filename, data_dir=None, progress=None, chu
     try:
         if suffix == ".csv":
             try:
-                reader = read_csv_chunks(path, chunksize=chunk_rows)
+                # The normaliser now melts a whole signal block at once, so a
+                # larger bounded cell budget is both faster and still safer
+                # than loading the full wide file.  Keep the limit tunable for
+                # machines with less memory.
+                max_values = max(100_000, int(os.getenv("PID_IMPORT_MAX_VALUES", "500000")))
+                reader = read_csv_chunks(path, chunksize=chunk_rows, max_values=max_values)
                 first = next(reader)
             except StopIteration as exc:
                 raise ValueError("输入文件没有数据行") from exc

@@ -9,10 +9,14 @@ import sqlite3
 from threading import Lock
 from uuid import uuid4
 
-from .config import DATA_DIR
+from .config import DATA_DIR, IMPORT_WORKERS
 from .importer import import_dataset
 
-_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pid-import")
+# Concurrent imports share bounded per-chunk buffers, but the cross-chunk
+# dedupe compaction can use PID_DUCKDB_MEMORY_LIMIT per worker for smaller
+# files, so the pool size is a deliberate trade-off exposed via
+# PID_IMPORT_WORKERS (default 2).
+_executor = ThreadPoolExecutor(max_workers=IMPORT_WORKERS, thread_name_prefix="pid-import")
 _jobs: dict[str, dict] = {}
 _lock = Lock()
 

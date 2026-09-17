@@ -13,6 +13,7 @@ __pycache__/
 .logs/
 .tmp/
 .tmp-*/
+.env
 
 # Imported data & runtime state (never commit)
 data/raw/

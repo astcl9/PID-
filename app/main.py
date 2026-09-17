@@ -1,5 +1,4 @@
 from pathlib import Path
-import tempfile
 import csv
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -14,9 +13,8 @@ import pandas as pd
 from .config import DATA_DIR, MAX_UPLOAD_MB
 from .jobs import create_job, get_job, job_summary
 from uuid import uuid4
-from .importer import normalize_file
-from .storage import save_dataset, list_meta, load_frame, update_signal_metadata
-from .query import query_data, daily_summary
+from .storage import list_meta, load_frame, update_signal_metadata, csv_stream
+from .query import query_data
 from .segmentation import segment_dataframe
 from .models import (
     DataResponse,
@@ -33,6 +31,7 @@ from .models import (
 
 app = FastAPI(title="PID Data Visualization API", version="0.1.0")
 logger = logging.getLogger(__name__)
+SEGMENT_CACHE_MAX = int(os.getenv("PID_SEGMENT_CACHE_MAX", "32"))
 SEGMENTS: dict[str, list[dict]] = {}
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
@@ -57,6 +56,28 @@ def _read_segment_store(dataset_id: str) -> dict[str, list[dict]]:
 def _write_segment_store(dataset_id: str, store: dict[str, list[dict]]) -> None:
     path = _segment_store_path(dataset_id)
     path.write_text(json.dumps(store, default=str, ensure_ascii=False), encoding="utf-8")
+
+
+def _cache_get(key: str) -> list[dict] | None:
+    """Return a cached segmentation, moving it to the most-recently-used end."""
+    value = SEGMENTS.get(key)
+    if value is not None:
+        del SEGMENTS[key]
+        SEGMENTS[key] = value
+    return value
+
+
+def _cache_put(key: str, value: list[dict]) -> None:
+    """Store a segmentation, evicting least-recently-used entries over budget.
+
+    The on-disk per-dataset store remains the source of truth; this in-memory
+    cache only avoids re-reading JSON, so eviction never loses data.
+    """
+    if key in SEGMENTS:
+        del SEGMENTS[key]
+    SEGMENTS[key] = value
+    while len(SEGMENTS) > SEGMENT_CACHE_MAX:
+        del SEGMENTS[next(iter(SEGMENTS))]
 
 
 def _segments_for_frame(frame: pd.DataFrame, dataset_id: str, loop: str | None = None) -> list[dict]:
@@ -244,22 +265,28 @@ def segments(dataset_id: str, start: str | None = None, end: str | None = None, 
     if not start or not end: raise HTTPException(400, "需要 start/end 或 date")
     start, end = _validate_window(start, end)
     key = f"{dataset_id}:{start}:{end}:{loop or ''}"
-    stored = _read_segment_store(dataset_id)
-    if not recompute and key in stored:
-        SEGMENTS[key] = stored[key]
-    if recompute or key not in SEGMENTS:
-        from . import db
-        if db.enabled():
+    result = None if recompute else _cache_get(key)
+    if result is None:
+        stored = _read_segment_store(dataset_id)
+        if not recompute and key in stored:
+            result = stored[key]
+            _cache_put(key, result)
+        else:
+            # Segmentation only needs 1-minute resolution, so query bucketed
+            # extrema instead of loading every raw sample.  This keeps memory
+            # bounded for large single-day datasets (both Parquet and PostgreSQL
+            # backends already aggregate inside the database engine).
             bounded = query_data(dataset_id, start, end, resolution="1m", max_points=100000)
             frame = pd.DataFrame(bounded.get("rows", []))
-        else:
-            frame = load_frame(dataset_id, start, end)
-        frame = _apply_signal_types(frame, dataset_id)
-        SEGMENTS[key] = _segments_for_frame(frame, dataset_id=dataset_id, loop=loop)
-        stored[key] = SEGMENTS[key]
-        _write_segment_store(dataset_id, stored)
-    logger.info("served segments dataset_id=%s loop=%s start=%s end=%s count=%s", dataset_id, loop, start, end, len(SEGMENTS[key]))
-    return SEGMENTS[key]
+            if not frame.empty and "timestamp" in frame:
+                frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+            frame = _apply_signal_types(frame, dataset_id)
+            result = _segments_for_frame(frame, dataset_id=dataset_id, loop=loop)
+            _cache_put(key, result)
+            stored[key] = result
+            _write_segment_store(dataset_id, stored)
+    logger.info("served segments dataset_id=%s loop=%s start=%s end=%s count=%s", dataset_id, loop, start, end, len(result))
+    return result
 
 
 @app.get("/api/segments/export")
@@ -282,23 +309,31 @@ def export_segments(dataset_id: str, start: str | None = None, end: str | None =
 @app.patch("/api/segments/{segment_id}")
 def update_segment(segment_id: str, type: str | None = None, start: str | None = None,
                    end: str | None = None, note: str | None = None):
-    for values in SEGMENTS.values():
-        for item in values:
-            if item["id"] == segment_id:
+    if type is None and start is None and end is None and note is None:
+        raise HTTPException(400, "没有提供任何修改字段")
+    # Manual corrections are persisted per dataset, so a PATCH must find the
+    # segment on disk rather than only in the in-memory SEGMENTS cache.  This
+    # makes edits survive a service restart.
+    segments_dir = DATA_DIR / "segments"
+    if not segments_dir.exists():
+        raise HTTPException(404, "分段不存在")
+    for store_path in sorted(segments_dir.glob("*.json")):
+        dataset_id = store_path.stem
+        stored = _read_segment_store(dataset_id)
+        for key, items in stored.items():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if item.get("id") != segment_id:
+                    continue
                 if type: item["type"] = type
                 if start: item["start"] = start
                 if end: item["end"] = end
                 if note is not None: item["note"] = note
                 item["manual_override"] = True
-                # Persist manual corrections so they survive a service restart.
-                for key, values in SEGMENTS.items():
-                    if item in values:
-                        dataset_id = item.get("dataset_id", "")
-                        if dataset_id:
-                            stored = _read_segment_store(dataset_id)
-                            stored[key] = values
-                            _write_segment_store(dataset_id, stored)
-                        break
+                _write_segment_store(dataset_id, stored)
+                # Keep the in-memory cache in sync when it was already populated.
+                _cache_put(key, items)
                 return item
     raise HTTPException(404, "分段不存在")
 
@@ -311,17 +346,12 @@ def export_data(dataset_id: str, date: str, loop: str | None = None, start: str 
         raise HTTPException(400, "日期格式无效，请使用 YYYY-MM-DD") from exc
     start, end = _validate_window(start, end)
     from . import db
+    type_map = _signal_type_map(dataset_id)
+    tags = [tag for tag in type_map if tag.startswith(f"{loop}.")] if loop else None
     if db.enabled():
-        tags = None
-        if loop:
-            tags = [item["tag"] for item in next((x for x in list_meta() if x.get("id") == dataset_id), {}).get("signals", []) if str(item.get("tag", "")).startswith(f"{loop}.")]
         return StreamingResponse(db.csv_stream(dataset_id, start, end, tags=tags), media_type="text/csv",
                                  headers={"Content-Disposition": f'attachment; filename="pid-{date}.csv"'})
-    frame = load_frame(dataset_id, start, end)
-    frame = _apply_signal_types(frame, dataset_id)
-    if loop: frame = frame[frame.tag.astype(str).str.startswith(f"{loop}.")]
-    buf = io.StringIO(); frame.to_csv(buf, index=False)
-    return StreamingResponse(iter([buf.getvalue().encode("utf-8-sig")]), media_type="text/csv",
+    return StreamingResponse(csv_stream(dataset_id, start, end, tags=tags, type_map=type_map), media_type="text/csv",
                              headers={"Content-Disposition": f'attachment; filename="pid-{date}.csv"'})
 
 def datePlus(date: str) -> str:

@@ -1,5 +1,5 @@
 import pandas as pd
-from app.importer import normalize_file, classify_signal, detect_csv_encoding, read_csv_chunks
+from app.importer import normalize_file, classify_signal, detect_csv_encoding, read_csv_chunks, detect_timestamp
 
 def test_classify_signal():
     assert classify_signal("TIC.PV") == "PV"
@@ -22,6 +22,17 @@ def test_gb18030_csv_with_chinese_headers(tmp_path):
     _, frame, report = normalize_file(p)
     assert len(frame) == 3
     assert {item["tag"] for item in report["signals"]} == {"回路1.PV", "回路1.SV", "回路1.MV"}
+
+
+def test_sequence_column_does_not_mask_chinese_timestamp(tmp_path):
+    p = tmp_path / "sequence-and-time.csv"
+    text = "序号,时间,回路1.PV\n0,2026-06-20 00:00:00,1\n1,2026-06-20 00:00:01,2\n"
+    p.write_bytes(text.encode("gb18030"))
+    frame = next(read_csv_chunks(p, chunksize=10))
+    assert detect_timestamp(frame) == "时间"
+    _, normalized, report = normalize_file(p)
+    assert normalized["timestamp"].min() == pd.Timestamp("2026-06-20 00:00:00")
+    assert "序号" not in {item["tag"] for item in report["signals"]}
 
 
 def test_utf8_bom_and_utf16_csv(tmp_path):

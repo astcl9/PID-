@@ -1,23 +1,22 @@
 from pathlib import Path
 import json
+import os
 import pandas as pd
 from .config import DATA_DIR
 from . import db
 
-def save_dataset(dataset_id: str, frame: pd.DataFrame, source: Path, report: dict) -> None:
-    root = DATA_DIR
-    (root / "raw" / dataset_id).mkdir(parents=True, exist_ok=True)
-    (root / "parquet" / dataset_id).mkdir(parents=True, exist_ok=True)
-    (root / "raw" / dataset_id / source.name).write_bytes(source.read_bytes())
-    for day, part in frame.groupby(frame["timestamp"].dt.date):
-        dest = root / "parquet" / dataset_id / f"date={day.isoformat()}"
-        dest.mkdir(parents=True, exist_ok=True)
-        partition = dest / "data.parquet"
-        part.to_parquet(partition, index=False)
-        if db.enabled():
-            db.insert_parquet(dataset_id, partition)
-    (root / "meta").mkdir(exist_ok=True)
-    (root / "meta" / f"{dataset_id}.json").write_text(json.dumps(report, default=str, ensure_ascii=False), encoding="utf-8")
+
+def _duckdb_threads() -> int:
+    """DuckDB worker threads for query aggregation (default: all CPU cores).
+
+    Override with PID_DUCKDB_THREADS; PID_DUCKDB_MEMORY_LIMIT controls the
+    in-memory budget for the same aggregation connection.
+    """
+    raw = os.getenv("PID_DUCKDB_THREADS", "").strip()
+    if raw.isdigit():
+        return max(1, int(raw))
+    return os.cpu_count() or 4
+
 
 def load_frame(dataset_id: str, start=None, end=None, tags=None) -> pd.DataFrame:
     """Load a bounded frame, pruning day partitions before they are scanned."""
@@ -104,7 +103,10 @@ def query_buckets(dataset_id: str, start, end, tags=None, seconds: int = 60) -> 
         GROUP BY tag, type, time_bucket(INTERVAL {seconds} SECOND, timestamp)
         ORDER BY tag, time_bucket(INTERVAL {seconds} SECOND, timestamp)
     """
-    con = duckdb.connect(config={"memory_limit": "512MB", "threads": 2})
+    con = duckdb.connect(config={
+        "memory_limit": os.getenv("PID_DUCKDB_MEMORY_LIMIT", "512MB"),
+        "threads": _duckdb_threads(),
+    })
     try:
         result = con.execute(sql, params).df()
     finally:
@@ -115,6 +117,51 @@ def query_buckets(dataset_id: str, start, end, tags=None, seconds: int = 60) -> 
         if row["max_timestamp"] != row["min_timestamp"]:
             rows.append({"timestamp": row["max_timestamp"], "tag": row["tag"], "type": row["type"], "value": row["max_value"]})
     return pd.DataFrame(rows, columns=["timestamp", "tag", "type", "value"]).sort_values(["tag", "timestamp"])
+
+
+def csv_stream(dataset_id: str, start, end, tags=None, type_map=None):
+    """Stream CSV rows from day-partitioned Parquet without loading a whole day.
+
+    Mirrors ``db.csv_stream`` for the default local backend so exporting a
+    large single-day dataset does not require materialising every row at once.
+    """
+    import csv
+    import io
+    import pyarrow.parquet as pq
+
+    base = DATA_DIR / "parquet" / dataset_id
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    columns = ["dataset_id", "timestamp", "tag", "type", "value", "quality", "unit"]
+    files = []
+    for path in base.glob("date=*/*.parquet"):
+        try:
+            day = pd.Timestamp(path.parent.name.split("=", 1)[1]).date()
+        except (ValueError, IndexError):
+            continue
+        if day < start_ts.date():
+            continue
+        if end_ts == end_ts.normalize() and day >= end_ts.date():
+            continue
+        files.append(path)
+    yield "\ufeff" + ",".join(columns) + "\n"
+    tag_set = set(tags) if tags is not None else None
+    type_map = type_map or {}
+    for path in sorted(files):
+        parquet = pq.ParquetFile(path)
+        for batch in parquet.iter_batches(batch_size=50_000, columns=columns):
+            frame = batch.to_pandas()
+            frame = frame[(frame["timestamp"] >= start_ts) & (frame["timestamp"] < end_ts)]
+            if tag_set is not None:
+                frame = frame[frame["tag"].isin(tag_set)]
+            if type_map:
+                frame = frame.copy()
+                frame["type"] = frame["tag"].astype(str).map(type_map).fillna(frame["type"])
+            if frame.empty:
+                continue
+            output = io.StringIO()
+            frame.to_csv(output, index=False, header=False)
+            yield output.getvalue()
+
 
 def list_meta() -> list[dict]:
     out = []
