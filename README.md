@@ -51,6 +51,18 @@ PostgreSQL 密码必须通过 `PID_POSTGRES_PASSWORD` 环境变量提供；Compo
 
 文件必须包含时间列（如 `timestamp`、`time` 或 `datetime`）。CSV 会自动识别 UTF-8（含 BOM）、GB18030/GBK 和 UTF-16 编码；其他数值列会被识别为信号；名称包含 `PV`、`SV`/`SP`、`MV` 的列会自动归类，导入后仍可在页面按信号筛选。默认单文件上限为 2048 MiB，可通过 `PID_MAX_UPLOAD_MB` 调整。多个上传会并发导入，并发数默认 2，可通过 `PID_IMPORT_WORKERS` 调整（注意并发数越高，去重整理阶段的峰值内存越大）。Parquet 写入压缩默认用 `snappy`（写盘更快、文件略大），可通过 `PID_PARQUET_COMPRESSION` 改为 `zstd`、`gzip` 或 `none`。
 
+## 大小路由
+
+导入后端按文件大小自动选择（详见 docs/操作指南.md）：
+
+| 文件 | 后端 |
+|------|------|
+| CSV < 100 MB | Parquet + DuckDB |
+| CSV >= 100 MB | PostgreSQL（需配置连接） |
+| XLSX 任何大小 | Parquet + DuckDB |
+
+阈值通过 PID_LARGE_FILE_THRESHOLD_MB 调整。
+
 ## 日内时间窗口
 
 进入“单日”页面后，使用“日内时间窗口”滑块移动起始时间，选择窗口长度后会重新请求该段数据。支持全天、6 小时、3 小时、1 小时、30 分钟和 15 分钟；数据查询使用半开区间 `[start, end)`，不会重复跨日边界。
@@ -87,3 +99,4 @@ docker compose cp postgres:/tmp/pid.backup .\pid.backup
 ```
 
 恢复前先保留当前数据副本。文件模式可在服务停止时还原完整 `data/`；PostgreSQL 模式使用 `pg_restore --clean --if-exists` 恢复到空闲维护窗口，并确认 `data/meta/` 与数据库中的数据集编号一致。
+

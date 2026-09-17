@@ -384,6 +384,17 @@ def _compact_day_partitions(root: Path, dataset_id: str, days) -> dict[str, tupl
     return final_stats
 
 
+def import_parquet_only(path, dataset_id, filename, data_dir=None, progress=None, chunk_rows=25000):
+    """Force the Parquet path regardless of the global PID_STORAGE_BACKEND env.
+
+    Uses a thread-scoped override instead of mutating ``os.environ`` so that a
+    small file imported by one worker cannot flip the backend seen by another
+    concurrent import.
+    """
+    from . import db
+    with db.import_backend_override("parquet"):
+        return import_dataset(path, dataset_id, filename, data_dir=data_dir, progress=progress, chunk_rows=chunk_rows)
+
 def import_dataset(path, dataset_id, filename, data_dir=None, progress=None, chunk_rows=25000):
     """Stream a CSV/XLSX into date-partitioned Parquet files in bounded chunks."""
     path = Path(path)
@@ -485,7 +496,10 @@ def import_dataset(path, dataset_id, filename, data_dir=None, progress=None, chu
                     "start_time": stats[1], "end_time": stats[2], "warnings": warnings,
                     "signals": [{"tag": str(t), "type": str(k)} for t, k in sigs],
                     "loops": sorted({str(t).rsplit('.', 1)[0] for t, _ in sigs if '.' in str(t)}),
-                    "days": [str(d) for d in days], "day_summaries": day_summaries}
+                    "days": [str(d) for d in days], "day_summaries": day_summaries,
+                    # Recorded so the query layer can route this dataset back to
+                    # Parquet after a restart, mirroring the PostgreSQL importer.
+                    "storage": "parquet"}
         (root / "meta").mkdir(parents=True, exist_ok=True)
         (root / "meta" / f"{dataset_id}.json").write_text(json.dumps(metadata, default=str, ensure_ascii=False), encoding="utf-8")
         raw = root / "raw" / dataset_id
@@ -503,3 +517,4 @@ def import_dataset(path, dataset_id, filename, data_dir=None, progress=None, chu
             except Exception: pass
         if not success:
             shutil.rmtree(root / "parquet" / dataset_id, ignore_errors=True)
+

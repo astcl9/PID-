@@ -16,7 +16,7 @@ def query_data(dataset_id, start, end, tags=None, resolution="auto", max_points=
     span = end_ts - start_ts
     if resolution == "raw" and span > pd.Timedelta(hours=6):
         resolution = "10s" if span <= pd.Timedelta(days=2) else "1m"
-    if db.enabled() and resolution != "raw":
+    if db.uses_database(dataset_id) and resolution != "raw":
         seconds = {"10s": 10, "1m": 60, "10m": 600, "1h": 3600}[resolution]
         frame = db.query_buckets(dataset_id, start_ts, end_ts, tags=tags, seconds=seconds)
         if frame.empty:
@@ -42,7 +42,7 @@ def query_data(dataset_id, start, end, tags=None, resolution="auto", max_points=
     return {"resolution": resolution, "rows": df.where(pd.notna(df), None).to_dict("records")}
 
 def daily_summary(dataset_id):
-    if db.enabled():
+    if db.uses_database(dataset_id):
         return db.daily_summary(dataset_id)
     df = load_frame(dataset_id)
     if df.empty: return []

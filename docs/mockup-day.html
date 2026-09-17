@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>PID 数据可视化 · 单日视图预览</title>
+<script src="C:/Users/llin/Documents/ChatGPT/PID数据可视化/app/static/vendor/plotly-2.35.2.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #f4f6f9; color: #2c3e50; }
+  .header { background: linear-gradient(135deg,#1f3b57,#2d5a87); color:#fff; padding: 14px 24px; display:flex; align-items:center; justify-content:space-between; }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .header .sub { font-size: 12px; opacity:.75; margin-top:2px; }
+  .badge { background:#e8a13a; color:#1f3b57; font-size:12px; padding:3px 10px; border-radius:12px; font-weight:600; }
+  .page { max-width: 1400px; margin: 16px auto; padding: 0 20px 40px; }
+  .toolbar { background:#fff; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.08); padding:12px 16px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+  .toolbar label { font-size:13px; color:#5a6b7c; }
+  .toolbar select, .toolbar input { font-size:13px; padding:5px 8px; border:1px solid #d5dde6; border-radius:5px; }
+  .btn { background:#2d5a87; color:#fff; border:none; padding:7px 16px; border-radius:5px; font-size:13px; cursor:pointer; }
+  .btn.secondary { background:#eef2f6; color:#2d5a87; border:1px solid #d5dde6; }
+  .btn.warn { background:#e8a13a; }
+  .stats { display:grid; grid-template-columns: repeat(6,1fr); gap:12px; margin-bottom:16px; }
+  .stat { background:#fff; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.06); padding:12px 14px; }
+  .stat .k { font-size:12px; color:#8a99a8; }
+  .stat .v { font-size:20px; font-weight:700; margin-top:4px; color:#1f3b57; }
+  .stat .v .u { font-size:12px; font-weight:400; color:#8a99a8; margin-left:3px; }
+  .card { background:#fff; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,.08); padding:16px 20px; margin-bottom:16px; }
+  .card h2 { font-size:15px; font-weight:600; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; }
+  .card h2 .tag { font-size:11px; color:#2d5a87; background:#e7f0f8; padding:2px 8px; border-radius:10px; font-weight:400; }
+  #chart { width:100%; height:420px; }
+  .slider-row { display:flex; align-items:center; gap:14px; margin-top:12px; padding-top:12px; border-top:1px dashed #e3e9f0; }
+  .slider-row .lab { font-size:12px; color:#8a99a8; white-space:nowrap; }
+  .slider-row input[type=range] { flex:1; }
+  .win { font-size:12px; color:#1f3b57; background:#e7f0f8; padding:3px 10px; border-radius:10px; white-space:nowrap; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; color:#8a99a8; font-weight:500; padding:8px 10px; border-bottom:2px solid #eef2f6; }
+  td { padding:8px 10px; border-bottom:1px solid #f2f5f8; }
+  tr:hover td { background:#f7fafd; }
+  .pill { font-size:11px; padding:2px 9px; border-radius:10px; font-weight:600; }
+  .pill.stable { background:#e2f4e8; color:#1e8a4c; }
+  .pill.trace { background:#e7f0f8; color:#2d5a87; }
+  .pill.alert { background:#fdeaea; color:#c0392b; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>PID 历史数据可视化 · 单日视图</h1>
+    <div class="sub">数据集：#1 催化裂化主分馏塔 TIC-101 &nbsp;|&nbsp; 采样 5s &nbsp;|&nbsp; 存储：Parquet / DuckDB</div>
+  </div>
+  <span class="badge">预览效果图</span>
+</div>
+<div class="page">
+  <div class="toolbar">
+    <label>日期</label>
+    <select><option>2026-09-15（周二）</option><option>2026-09-14（周一）</option><option>2026-09-13（周日）</option></select>
+    <label>时间窗口</label>
+    <select><option>1 小时</option><option selected>15 分钟</option><option>30 分钟</option><option>6 小时</option></select>
+    <button class="btn">上一窗口</button>
+    <button class="btn">下一窗口</button>
+    <button class="btn secondary">回到全图</button>
+    <span style="flex:1"></span>
+    <button class="btn secondary">导出当前窗口 CSV</button>
+    <button class="btn warn">智能分段分析</button>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="k">当日数据点</div><div class="v">17,281</div></div>
+    <div class="stat"><div class="k">PV 均值 / 波动</div><div class="v">231.4<span class="u">°C</span></div></div>
+    <div class="stat"><div class="k">MV 动作次数</div><div class="v">63</div></div>
+    <div class="stat"><div class="k">SP 变更次数</div><div class="v">3</div></div>
+    <div class="stat"><div class="k">最大偏差 |PV-SP|</div><div class="v">3.62<span class="u">°C</span></div></div>
+    <div class="stat"><div class="k">超限时长</div><div class="v">12<span class="u">min</span></div></div>
+  </div>
+
+  <div class="card">
+    <h2>PV / SP / MV 趋势曲线 <span class="tag">拖拽平移 · 滚轮缩放 · 双轴（左 °C / 右 %）</span></h2>
+    <div id="chart"></div>
+    <div class="slider-row">
+      <span class="lab">时间窗口</span>
+      <input type="range" min="0" max="100" value="20">
+      <input type="range" min="0" max="100" value="60">
+      <span class="win">10:15 – 11:15</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>智能分段结果 <span class="tag">按趋势自动切分 · 可点击跳转</span></h2>
+    <table>
+      <tr><th>时段</th><th>时长</th><th>状态</th><th>PV 变化</th><th>波动 (σ)</th><th>建议</th></tr>
+      <tr><td>00:00 – 06:12</td><td>6h12m</td><td><span class="pill stable">平稳</span></td><td>230.8 → 231.1 °C</td><td>0.18</td><td>参数保持不变</td></tr>
+      <tr><td>06:12 – 07:48</td><td>1h36m</td><td><span class="pill trace">设定值阶跃响应</span></td><td>231.1 → 236.5 °C</td><td>1.05</td><td>可复用于整定辨识</td></tr>
+      <tr><td>07:48 – 16:30</td><td>8h42m</td><td><span class="pill stable">平稳</span></td><td>236.4 → 236.6 °C</td><td>0.15</td><td>参数保持不变</td></tr>
+      <tr><td>16:30 – 17:05</td><td>35m</td><td><span class="pill alert">外部扰动</span></td><td>236.6 → 233.9 °C</td><td>0.92</td><td>建议检查进料温度</td></tr>
+      <tr><td>17:05 – 24:00</td><td>6h55m</td><td><span class="pill stable">恢复平稳</span></td><td>233.9 → 234.0 °C</td><td>0.16</td><td>参数保持不变</td></tr>
+    </table>
+  </div>
+</div>
+<script>
+// —— 预览用合成数据（仅用于效果图渲染）——
+const N = 17281, t0 = new Date('2026-09-15T00:00:00').getTime(), step = 5*1000;
+let T=[], PV=[], SP=[], MV=[];
+function spike(x, c, w){ return Math.exp(-Math.pow((x-c)/w,2)); }
+for (let i=0;i<N;i++){
+  const t = t0 + i*step, h = i*step/3600000;
+  let sp = 231;
+  if (h>=6.2 && h<7.8) sp = 231 + 5.5*(h-6.2)/1.6;
+  else if (h>=7.8 && h<16.5) sp = 236.5;
+  else if (h>=16.5 && h<17.083) sp = 236.5 - 2.6*(h-16.5)/0.583;
+  else if (h>=17.083) sp = 233.9;
+  let pv = sp + 0.35*Math.sin(i/40) + 0.25*Math.sin(i/7.3)
+       + 2.4*spike(h,6.28,0.18) - 1.8*spike(h,16.55,0.12) - 1.4*spike(h,16.62,0.08);
+  let mv = 48 + 6*Math.sin(i/55) + 0.8*Math.sin(i/9) + 14*spike(h,6.30,0.22)
+       - 10*spike(h,16.58,0.15) + 18*spike(h,6.35,0.10);
+  T.push(new Date(t)); PV.push(+pv.toFixed(3)); SP.push(sp); MV.push(+mv.toFixed(2));
+}
+const base = {x:T, type:'scattergl', mode:'lines'};
+Plotly.newPlot('chart',[
+  {...base,y:SP,name:'SP 设定值',line:{color:'#c0392b',width:1.5,dash:'dash'}},
+  {...base,y:PV,name:'PV 过程值',line:{color:'#2d5a87',width:1.4}},
+  {...base,y:MV,name:'MV 输出 %',yaxis:'y2',line:{color:'#e8a13a',width:1.2}}
+],{
+  margin:{t:10,r:50,b:40,l:55},
+  xaxis:{type:'date',rangeslider:{visible:false},gridcolor:'#eef2f6'},
+  yaxis:{title:'温度 (°C)',gridcolor:'#eef2f6'},
+  yaxis2:{title:'输出 (%)',overlaying:'y',side:'right',gridcolor:'#f7f9fb'},
+  legend:{orientation:'h',y:1.12,x:0},
+  plot_bgcolor:'#fff',paper_bgcolor:'#fff',
+  shapes:[
+    {type:'rect',xref:'x',x0:new Date(t0+16.5*3600000),x1:new Date(t0+17.083*3600000),
+     yref:'paper',y0:0,y1:1,fillcolor:'rgba(192,57,43,0.07)',line:{width:0}},
+    {type:'rect',xref:'x',x0:new Date(t0+6.2*3600000),x1:new Date(t0+7.8*3600000),
+     yref:'paper',y0:0,y1:1,fillcolor:'rgba(45,90,135,0.06)',line:{width:0}}
+  ],
+  annotations:[
+    {x:new Date(t0+6.99*3600000),y:238,text:'阶跃响应段',showarrow:true,arrowcolor:'#2d5a87',font:{size:11,color:'#2d5a87'}},
+    {x:new Date(t0+16.79*3600000),y:231,text:'外部扰动段',showarrow:true,arrowcolor:'#c0392b',font:{size:11,color:'#c0392b'}}
+  ]
+},{displayModeBar:false,scrollZoom:true});
+</script>
+</body>
+</html>

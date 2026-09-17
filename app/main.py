@@ -11,7 +11,7 @@ import os
 import shutil
 import pandas as pd
 from .config import DATA_DIR, MAX_UPLOAD_MB
-from .jobs import create_job, get_job, job_summary
+from .jobs import create_job, get_job, job_summary, pick_backend
 from uuid import uuid4
 from .storage import list_meta, load_frame, update_signal_metadata, csv_stream
 from .query import query_data
@@ -180,7 +180,8 @@ async def upload_dataset(file: UploadFile = File(...)):
                 temp.unlink(missing_ok=True)
                 raise HTTPException(413, "文件超过大小限制")
             out.write(chunk)
-    job_id = create_job(temp, dataset_id, file.filename or temp.name)
+    backend = pick_backend(temp, file.filename or temp.name)
+    job_id = create_job(temp, dataset_id, file.filename or temp.name, backend=backend)
     logger.info("accepted upload filename=%s dataset_id=%s job_id=%s bytes=%s", file.filename, dataset_id, job_id, size)
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued"})
 
@@ -348,7 +349,7 @@ def export_data(dataset_id: str, date: str, loop: str | None = None, start: str 
     from . import db
     type_map = _signal_type_map(dataset_id)
     tags = [tag for tag in type_map if tag.startswith(f"{loop}.")] if loop else None
-    if db.enabled():
+    if db.uses_database(dataset_id):
         return StreamingResponse(db.csv_stream(dataset_id, start, end, tags=tags), media_type="text/csv",
                                  headers={"Content-Disposition": f'attachment; filename="pid-{date}.csv"'})
     return StreamingResponse(csv_stream(dataset_id, start, end, tags=tags, type_map=type_map), media_type="text/csv",
@@ -357,3 +358,4 @@ def export_data(dataset_id: str, date: str, loop: str | None = None, start: str 
 def datePlus(date: str) -> str:
     value = pd.Timestamp(date) + pd.Timedelta(days=1)
     return value.strftime("%Y-%m-%d")
+

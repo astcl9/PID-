@@ -4,13 +4,14 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sqlite3
 from threading import Lock
 from uuid import uuid4
 
-from .config import DATA_DIR, IMPORT_WORKERS
-from .importer import import_dataset
+from .config import DATA_DIR, IMPORT_WORKERS, LARGE_FILE_THRESHOLD_MB
+from .importer import import_dataset, import_parquet_only
 
 # Concurrent imports share bounded per-chunk buffers, but the cross-chunk
 # dedupe compaction can use PID_DUCKDB_MEMORY_LIMIT per worker for smaller
@@ -79,18 +80,34 @@ def job_summary() -> dict[str, int]:
                 counts[status] += 1
     return counts
 
-def create_job(path: Path, dataset_id: str, filename: str) -> str:
+def pick_backend(path: Path, filename: str) -> str:
+    """Size router: CSV >= threshold -> PostgreSQL; everything else -> Parquet.
+
+    An explicit global ``PID_STORAGE_BACKEND`` wins, which is what the Docker
+    guide documents ("all imports go to PostgreSQL").  Size routing only decides
+    the backend for the default mixed deployment where the global value is
+    Parquet.
+    """
+    configured = os.getenv("PID_STORAGE_BACKEND", os.getenv("PID_STORAGE", "parquet")).strip().lower()
+    if configured in {"postgres", "postgresql", "clickhouse"}:
+        return configured
+    if Path(filename or path.name).suffix.lower() == ".csv" and path.stat().st_size >= LARGE_FILE_THRESHOLD_MB * 1024 * 1024:
+        return "postgres"
+    return "parquet"
+
+
+def create_job(path: Path, dataset_id: str, filename: str, backend: str | None = None) -> str:
     job_id = uuid4().hex
     with _lock:
-        _jobs[job_id] = {"job_id": job_id, "status": "queued", "progress": 0,
+        _jobs[job_id] = {"job_id": job_id, "status": "queued", "progress": 0, "backend": backend,
                          "rows_processed": 0, "bytes_processed": 0,
                          "total_bytes": path.stat().st_size, "filename": filename,
                          "created_at": _now()}
         _persist_job(_jobs[job_id])
-    _executor.submit(_run, job_id, path, dataset_id, filename)
+    _executor.submit(_run, job_id, path, dataset_id, filename, backend)
     return job_id
 
-def _run(job_id, path, dataset_id, filename):
+def _run(job_id, path, dataset_id, filename, backend=None):
     def progress(**values):
         with _lock:
             item = _jobs.get(job_id)
@@ -101,7 +118,13 @@ def _run(job_id, path, dataset_id, filename):
                 _persist_job(item)
     progress(stage="processing")
     try:
-        metadata = import_dataset(path, dataset_id, filename, data_dir=DATA_DIR, progress=progress)
+        if backend == "postgres":
+            from . import db
+            metadata = db.route_import(path, dataset_id, filename, DATA_DIR, "postgres", progress=progress)
+        elif backend == "parquet":
+            metadata = import_parquet_only(path, dataset_id, filename, data_dir=DATA_DIR, progress=progress)
+        else:
+            metadata = import_dataset(path, dataset_id, filename, data_dir=DATA_DIR, progress=progress)
         with _lock:
             _jobs[job_id].update({"status": "completed", "progress": 1, "metadata": metadata, "updated_at": _now()})
             _persist_job(_jobs[job_id])
@@ -121,3 +144,4 @@ def get_job(job_id: str):
 
 
 recover_interrupted_jobs()
+

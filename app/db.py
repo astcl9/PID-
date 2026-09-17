@@ -12,6 +12,8 @@ import os
 import json
 import shutil
 import itertools
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,13 +21,119 @@ import pandas as pd
 
 TABLE = "pid_samples"
 
+# Thread-scoped backend override used by the import workers.  The previous
+# implementation mutated process-wide ``os.environ``, which raced whenever two
+# concurrent imports disagreed about the backend.
+_OVERRIDE = threading.local()
+
+
+@contextmanager
+def import_backend_override(backend: str):
+    """Force the storage backend for the current thread only."""
+    previous = getattr(_OVERRIDE, "backend", None)
+    _OVERRIDE.backend = str(backend)
+    try:
+        yield
+    finally:
+        _OVERRIDE.backend = previous
+
+
+def _override_backend() -> str | None:
+    return getattr(_OVERRIDE, "backend", None)
+
+# Per-dataset backend override written by the size-based import router.
+# Key: dataset_id, Value: "postgres".  Absent key -> metadata file (or global env).
+_DATASET_BACKEND: dict[str, str] = {}
+
+DB_BACKENDS = {"postgres", "postgresql", "clickhouse"}
+POSTGRES_BACKENDS = {"postgres", "postgresql"}
+
+
+def mark_backend(dataset_id: str, backend: str) -> None:
+    _DATASET_BACKEND[str(dataset_id)] = str(backend)
+
+
+def _env_backend() -> str:
+    return os.getenv("PID_STORAGE_BACKEND", os.getenv("PID_STORAGE", "parquet")).strip().lower()
+
+
+def _effective_backend() -> str:
+    """Global backend, honouring a thread-scoped import override."""
+    return _override_backend() or _env_backend()
+
+
+def _meta_root(data_dir=None) -> Path:
+    if data_dir is not None:
+        return Path(data_dir)
+    # Resolve through the config module rather than a copied module-level name so
+    # that tests and callers that patch config.DATA_DIR are honoured.
+    from . import config
+    return Path(config.DATA_DIR)
+
+
+def _meta_backend(dataset_id: str, data_dir=None) -> str | None:
+    """Read the backend recorded by the importer in ``meta/<id>.json``.
+
+    The importer writes ``storage`` into the dataset metadata, so routing
+    survives a process restart without relying on in-memory state.  Legacy
+    datasets imported before that field existed return None and fall back to
+    the global environment variable.
+    """
+    path = _meta_root(data_dir) / "meta" / f"{dataset_id}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    value = payload.get("storage")
+    return str(value).strip().lower() if value else None
+
+
+def dataset_backend(dataset_id: str, data_dir=None) -> str:
+    """Resolve the effective backend for one dataset.
+
+    Priority: per-dataset override (size router) > imported metadata >
+    ``PID_STORAGE_BACKEND``/``PID_STORAGE`` environment.
+    """
+    override = _DATASET_BACKEND.get(str(dataset_id))
+    if override:
+        return override
+    scoped = _override_backend()
+    if scoped:
+        return scoped
+    recorded = _meta_backend(str(dataset_id), data_dir)
+    if recorded:
+        return recorded
+    return _env_backend()
+
+
+def dataset_uses_db(dataset_id: str, data_dir=None) -> bool:
+    return dataset_backend(dataset_id, data_dir) in DB_BACKENDS
+
+
+def uses_database(dataset_id: str, data_dir=None) -> bool:
+    """True when reads for this dataset must go to a database backend.
+
+    Callers previously tested only ``db.enabled()``, which is a global setting.
+    A dataset imported through the size router lives in PostgreSQL even when the
+    process-wide backend is Parquet, so every read path needs this per-dataset
+    check or it silently returns no rows.  Resolving via the recorded metadata
+    also means a small Parquet dataset is still read from Parquet when the
+    global backend is PostgreSQL.
+    """
+    return dataset_uses_db(dataset_id, data_dir)
+
+
+def dataset_uses_postgres(dataset_id: str, data_dir=None) -> bool:
+    return dataset_backend(dataset_id, data_dir) in POSTGRES_BACKENDS
+
+
 
 def enabled() -> bool:
-    return os.getenv("PID_STORAGE_BACKEND", os.getenv("PID_STORAGE", "parquet")).strip().lower() in {"clickhouse", "postgres", "postgresql"}
+    return _effective_backend() in {"clickhouse", "postgres", "postgresql"}
 
 
 def _postgres() -> bool:
-    return os.getenv("PID_STORAGE_BACKEND", os.getenv("PID_STORAGE", "parquet")).strip().lower() in {"postgres", "postgresql"}
+    return _effective_backend() in {"postgres", "postgresql"}
 
 
 def _client():
@@ -103,7 +211,7 @@ def insert_parquet(dataset_id: str, parquet_path: Path, batch_rows: int = 50_000
 
 
 def query_frame(dataset_id: str, start=None, end=None, tags=None) -> pd.DataFrame:
-    if _postgres():
+    if dataset_uses_postgres(dataset_id):
         from .postgres_db import query_frame as query_postgres
         return query_postgres(dataset_id, start, end, tags)
     client = _client()
@@ -131,7 +239,7 @@ def query_frame(dataset_id: str, start=None, end=None, tags=None) -> pd.DataFram
 
 
 def query_buckets(dataset_id: str, start, end, tags=None, seconds: int = 60) -> pd.DataFrame:
-    if _postgres():
+    if dataset_uses_postgres(dataset_id):
         from .postgres_db import query_buckets as buckets_postgres
         return buckets_postgres(dataset_id, start, end, tags, seconds)
     """Return two extrema per bucket directly from ClickHouse."""
@@ -167,7 +275,7 @@ def query_buckets(dataset_id: str, start, end, tags=None, seconds: int = 60) -> 
 
 
 def csv_stream(dataset_id: str, start, end, tags=None):
-    if _postgres():
+    if dataset_uses_postgres(dataset_id):
         from .postgres_db import csv_stream as stream_postgres
         yield from stream_postgres(dataset_id, start, end, tags)
         return
@@ -197,7 +305,7 @@ def csv_stream(dataset_id: str, start, end, tags=None):
 
 
 def daily_summary(dataset_id: str) -> list[dict]:
-    if _postgres():
+    if dataset_uses_postgres(dataset_id):
         from .postgres_db import daily_summary as summary_postgres
         return summary_postgres(dataset_id)
     client = _client()
@@ -227,6 +335,45 @@ def ping() -> bool:
     except Exception:
         return False
 
+
+
+def postgres_configured() -> bool:
+    """True when a PostgreSQL deployment looks intentionally configured.
+
+    The size router would otherwise send a >=100 MB CSV to a database that was
+    never set up, failing the whole upload in the default Parquet-only
+    deployment described in the README quickstart.
+    """
+    if _effective_backend() in {"postgres", "postgresql"}:
+        return True
+    for name in ("PID_POSTGRES_DSN", "PID_POSTGRES_PASSWORD", "PID_POSTGRES_HOST", "PID_POSTGRES_USER"):
+        if os.getenv(name, "").strip():
+            return True
+    return False
+
+
+def route_import(path: Path, dataset_id: str, filename: str, data_dir: Path, backend: str, progress=None, chunk_rows: int = 25000) -> dict:
+    """Import via the backend chosen by the size router."""
+    if backend in {"postgres", "postgresql"} and not postgres_configured():
+        # Fail with an actionable message instead of a raw psycopg connection
+        # error, and never silently fall back to Parquet for a file whose size
+        # is exactly what the router decided PostgreSQL should handle.
+        raise ValueError(
+            "该文件超过大小路由阈值，需要 PostgreSQL 后端，但未检测到数据库配置。"
+            "请设置 PID_POSTGRES_PASSWORD（及 PID_POSTGRES_HOST/USER/DATABASE）"
+            "或调整 PID_LARGE_FILE_THRESHOLD_MB。"
+        )
+    mark_backend(dataset_id, backend)
+    try:
+        if backend in {"postgres", "postgresql"}:
+            from .postgres_db import import_file as import_postgres
+            return import_postgres(path, dataset_id, filename, data_dir, progress, chunk_rows)
+        if backend == "clickhouse":
+            return import_file(path, dataset_id, filename, data_dir, progress, chunk_rows)
+        raise ValueError(f"未知存储后端: {backend}")
+    except Exception:
+        _DATASET_BACKEND.pop(str(dataset_id), None)
+        raise
 
 def import_file(path: Path, dataset_id: str, filename: str, data_dir: Path, progress=None, chunk_rows: int = 25000) -> dict:
     if _postgres():
@@ -293,3 +440,6 @@ def import_file(path: Path, dataset_id: str, filename: str, data_dir: Path, prog
         return metadata
     finally:
         client.close()
+
+
+

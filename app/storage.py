@@ -20,7 +20,10 @@ def _duckdb_threads() -> int:
 
 def load_frame(dataset_id: str, start=None, end=None, tags=None) -> pd.DataFrame:
     """Load a bounded frame, pruning day partitions before they are scanned."""
-    if db.enabled():
+    # Check the per-dataset backend, not just the global env: a large CSV
+    # imported through the size router lives in PostgreSQL even when the
+    # process default is Parquet.
+    if db.uses_database(dataset_id):
         return db.query_frame(dataset_id, start=start, end=end, tags=tags)
     base = DATA_DIR / "parquet" / dataset_id
     start_ts = pd.Timestamp(start) if start is not None else None
