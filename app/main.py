@@ -109,6 +109,10 @@ def _validate_window(start: str, end: str) -> tuple[str, str]:
         start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
     except (TypeError, ValueError, OverflowError) as exc:
         raise HTTPException(400, "时间格式无效，请使用 ISO 日期时间") from exc
+    # pd.Timestamp("") parses to NaT instead of raising; treat any NaT
+    # (unparseable or empty component) as an invalid window, not a valid one.
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        raise HTTPException(400, "时间格式无效，请使用 ISO 日期时间")
     if start_ts >= end_ts:
         raise HTTPException(400, "结束时间必须晚于开始时间")
     return start, end

@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][ValidateSet('baseline','agent','final-report')][string]$Mode,
   [Parameter(Mandatory=$true)][string]$TaskName,
@@ -130,19 +130,17 @@ try {
       $final = Join-Path $runRoot ("{0}-{1}.final.md" -f $TaskName, $stamp)
       $agentLog = Join-Path $runRoot ("{0}-{1}.agent.txt" -f $TaskName, $stamp)
       $started = Get-Date
-      # Prompt goes through stdin so long multi-line instructions are not limited
-      # by the Windows command-line length.  Transient upstream capacity/502
-      # errors are retried with backoff instead of losing the whole window.
+      # Dispatch to this thread so the change runs in-conversation. Retry on
+      # transient upstream capacity/502 errors.
       $agentExit = 1
       for ($try = 1; $try -le 3; $try++) {
         Write-Log "AGENT_ATTEMPT=$try"
-        if ($try -gt 1) { Remove-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue }
-        $prompt | & $codexExe exec -C $Workspace -s workspace-write --color never -o $final 2>&1 |
-          Tee-Object -FilePath $agentLog -Append | Out-Null
+        $output = & $codexExe queue --thread $ThreadId --message $prompt 2>&1
         $agentExit = $LASTEXITCODE
-        $logText = Get-Content -LiteralPath $agentLog -Raw -ErrorAction SilentlyContinue
+        $line = ($output | Out-String).Trim()
+        Write-Log "QUEUE_OUTPUT=$line"
         if ($agentExit -eq 0) { break }
-        if ($logText -match 'at capacity|502 Bad Gateway|Reconnecting') {
+        if ($line -match 'at capacity|502 Bad Gateway|Reconnecting') {
           Write-Log "AGENT_RETRYABLE_FAILURE exit=$agentExit"
           Start-Sleep -Seconds 90
           continue

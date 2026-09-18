@@ -26,6 +26,20 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 在服务器 Windows 防火墙放行 TCP 8080，其他设备访问 `http://服务器IP:8080`。数据会保存在项目下的 `data/` 目录；原始文件保存在 `data/raw/`，按天的 Parquet 数据保存在 `data/parquet/`。
 
+## 改代码后如何让网页端生效
+
+改完代码**不会**自动变成网页上的最新效果，分三层处理：
+
+**后端改动（`app/` 下的 `.py` 文件）**：必须重启 uvicorn。在运行服务的 PowerShell 窗口按 `Ctrl+C` 停掉，再重新执行启动命令。开发阶段建议加 `--reload`，保存代码后约 1 秒自动重载，不用手动重启：
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8080 --reload
+```
+
+**前端改动（`app/static/` 下的 `index.html`、`app.js`、CSS）**：不用重启服务，但浏览器可能用旧缓存。强刷一次即可：Edge / Chrome / Firefox 按 `Ctrl+F5`（或 `Ctrl+Shift+R`）；还不对就按 `F12` 打开开发者工具，右键刷新按钮选「清空缓存并硬性重新加载」。
+
+**分段结果缓存**：改了分段算法后页面看起来"没变化"，不是缓存问题——`/api/segments` 默认返回已持久化的旧分段（`data/segments/<数据集id>.json` 和内存缓存）。需要重新计算时，请求带 `recompute=true`，或停止服务后删掉对应数据集的分段缓存文件，再强刷页面。
+
 ## Docker
 
 ```powershell
