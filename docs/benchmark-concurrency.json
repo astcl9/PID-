@@ -1,0 +1,27 @@
+{
+  "generated_at": "2026-09-18T14:25:20",
+  "backend": "parquet",
+  "dataset": {
+    "loops": 50,
+    "signals": 150,
+    "minutes": 1440,
+    "normalized_rows": 216000
+  },
+  "load": {
+    "concurrent_users": 20,
+    "requests_per_user": 10,
+    "total_requests": 200,
+    "window": "随机回路 + 1~6 小时窗口 @1m 分辨率（3 信号/请求）"
+  },
+  "import_seconds": 0.792,
+  "wall_seconds": 4.18,
+  "completed_requests": 200,
+  "failed_requests": 0,
+  "requests_per_second": 47.84,
+  "latency_seconds": {
+    "p50": 0.4015,
+    "p95": 0.5217,
+    "max": 0.5517
+  },
+  "errors": []
+}

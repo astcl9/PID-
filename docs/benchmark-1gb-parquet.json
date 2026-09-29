@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-09-18T11:29:32",
+  "source_rows": 30000000,
+  "normalized_rows": 90000000,
+  "source_bytes": 1035000041,
+  "parquet_bytes": 641140744,
+  "generation_seconds": 0.0,
+  "import_seconds": 844.665085,
+  "source_rows_per_second": 35504.43,
+  "normalized_rows_per_second": 106551.11,
+  "python_peak_memory_bytes": 19530701,
+  "queries": {
+    "one_hour": {
+      "seconds": 0.339281,
+      "returned_points": 300
+    },
+    "one_day": {
+      "seconds": 0.130274,
+      "returned_points": 7200
+    }
+  },
+  "notes": "Peak memory is measured with tracemalloc and excludes some native-library allocations."
+}

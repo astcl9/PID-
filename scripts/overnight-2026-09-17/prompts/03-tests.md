@@ -22,7 +22,7 @@
 
 ## 全局约束（必须遵守）
 
-- 工作区：`C:\Users\llin\Documents\ChatGPT\PID数据可视化`；Python 一律用 `.venv\Scripts\python.exe`。
+- 工作区：`D:\codex\PID数据可视化`；Python 一律用 `.venv\Scripts\python.exe`。
 - **禁止**执行 `git commit`、`git push`、`git reset`、`git checkout`、`git clean`、`git stash`；只允许读 git 状态与 diff。
 - **禁止删除** `data/`、`postgres_data/`、`.tmp/` 下任何已有内容；不要读取或打印 `.env` 的密码明文。
 - 保留任务开始前已存在的未提交修改，不要回滚别人的改动。

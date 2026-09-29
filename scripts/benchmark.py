@@ -34,6 +34,8 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=100_000, help="Source CSV rows; normalized storage has three times this count")
     parser.add_argument("--work-dir", default=".tmp/benchmark")
     parser.add_argument("--report", default="docs/benchmark-latest.json")
+    parser.add_argument("--input-csv", default=None,
+                        help="Reuse an existing CSV instead of generating one (overrides --rows for generation)")
     parser.add_argument("--keep-data", action="store_true")
     args = parser.parse_args()
     if args.rows < 1:
@@ -41,7 +43,7 @@ def main() -> None:
 
     work = Path(args.work_dir).resolve()
     data_dir = work / "data"
-    source = work / "benchmark.csv"
+    source = Path(args.input_csv).resolve() if args.input_csv else work / "benchmark.csv"
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
@@ -54,8 +56,11 @@ def main() -> None:
 
     storage.DATA_DIR = data_dir
     generate_start = time.perf_counter()
-    generate_csv(source, args.rows)
-    generation_seconds = time.perf_counter() - generate_start
+    if args.input_csv:
+        generation_seconds = 0.0
+    else:
+        generate_csv(source, args.rows)
+        generation_seconds = time.perf_counter() - generate_start
     dataset_id = f"benchmark-{uuid4().hex[:8]}"
 
     tracemalloc.start()
@@ -64,6 +69,10 @@ def main() -> None:
     import_seconds = time.perf_counter() - import_start
     _, peak_memory = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+
+    # Normalized rows are always 3x the source rows (PV/SV/MV); derive the
+    # source count from metadata so --input-csv runs report correct numbers.
+    source_rows = metadata["rows"] // 3
 
     query_results = {}
     for label, end in [("one_hour", "2026-01-01T01:00:00"), ("one_day", "2026-01-02T00:00:00")]:
@@ -76,13 +85,13 @@ def main() -> None:
 
     result = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "source_rows": args.rows,
+        "source_rows": source_rows,
         "normalized_rows": metadata["rows"],
         "source_bytes": source.stat().st_size,
         "parquet_bytes": directory_size(data_dir / "parquet" / dataset_id),
         "generation_seconds": round(generation_seconds, 6),
         "import_seconds": round(import_seconds, 6),
-        "source_rows_per_second": round(args.rows / import_seconds, 2),
+        "source_rows_per_second": round(source_rows / import_seconds, 2),
         "normalized_rows_per_second": round(metadata["rows"] / import_seconds, 2),
         "python_peak_memory_bytes": peak_memory,
         "queries": query_results,

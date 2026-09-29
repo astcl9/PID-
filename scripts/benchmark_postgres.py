@@ -81,6 +81,8 @@ def main() -> None:
                         help="Source CSV rows; normalized rows = 3x this")
     parser.add_argument("--work-dir", default=".tmp/bench-pg")
     parser.add_argument("--report", default="docs/benchmark-postgres-latest.json")
+    parser.add_argument("--input-csv", default=None,
+                        help="Reuse an existing CSV instead of generating one (overrides --rows for generation)")
     parser.add_argument("--keep-data", action="store_true")
     args = parser.parse_args()
     if args.rows < 1:
@@ -99,12 +101,15 @@ def main() -> None:
     work.mkdir(parents=True)
     data_dir = work / "data"
     os.environ["PID_DATA_DIR"] = str(data_dir)
-    source = work / "benchmark.csv"
+    source = Path(args.input_csv).resolve() if args.input_csv else work / "benchmark.csv"
 
     # 生成（计时）
     gen_start = time.perf_counter()
-    generate_csv(source, args.rows)
-    generation_seconds = time.perf_counter() - gen_start
+    if args.input_csv:
+        generation_seconds = 0.0
+    else:
+        generate_csv(source, args.rows)
+        generation_seconds = time.perf_counter() - gen_start
 
     from app.importer import import_dataset
     from app.query import query_data
@@ -130,13 +135,15 @@ def main() -> None:
     result = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "backend": "postgres",
-        "source_rows": args.rows,
+        # Normalized rows are always 3x the source rows; derive the source
+        # count from metadata so --input-csv runs report correct numbers.
+        "source_rows": metadata["rows"] // 3,
         "normalized_rows": metadata["rows"],
         "source_bytes": source.stat().st_size,
         "postgres_delta_bytes": size_after - size_before,
         "generation_seconds": round(generation_seconds, 6),
         "import_seconds": round(import_seconds, 6),
-        "source_rows_per_second": round(args.rows / import_seconds, 2),
+        "source_rows_per_second": round((metadata["rows"] // 3) / import_seconds, 2),
         "normalized_rows_per_second": round(metadata["rows"] / import_seconds, 2),
         "queries": query_results,
         "notes": "postgres_delta_bytes 为 pid_samples 表+索引总占用在本次导入前后的增量；未含源文件与 raw 副本。",

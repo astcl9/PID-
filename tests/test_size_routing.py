@@ -1,4 +1,8 @@
-"""按大小路由导入后端：CSV < 100MB 走 Parquet，CSV >= 100MB 走 PostgreSQL，XLSX 永远走 Parquet。"""
+"""后端选择：Parquet 是唯一生产后端（2026-09-18 决策，见 docs/项目规划书-2026-09-17.md）。
+
+按大小路由已移除：所有文件默认走 Parquet；只有显式设置 PID_STORAGE_BACKEND=postgres
+才走 PostgreSQL（实验路径）。已按数据集记录的后端（meta 的 storage 字段）在读取侧
+仍然生效，保证实验数据集重启后仍能被正确路由。"""
 from pathlib import Path
 import json
 import os
@@ -34,9 +38,10 @@ def test_small_csv_routes_to_parquet(tmp_path):
     assert pick_backend(_sized_file(tmp_path, "a.csv", 1024), "a.csv") == "parquet"
 
 
-def test_large_csv_routes_to_postgres(tmp_path):
+def test_large_csv_stays_on_parquet(tmp_path):
+    """No size routing: even a huge CSV imports into Parquet by default."""
     big = _sized_file(tmp_path, "b.csv", 100 * 1024 * 1024 + 1)
-    assert pick_backend(big, "b.csv") == "postgres"
+    assert pick_backend(big, "b.csv") == "parquet"
 
 
 def test_xlsx_always_routes_to_parquet(tmp_path):
@@ -44,8 +49,8 @@ def test_xlsx_always_routes_to_parquet(tmp_path):
     assert pick_backend(big_xlsx, "c.xlsx") == "parquet"
 
 
-def test_global_backend_overrides_size_router(tmp_path, monkeypatch):
-    """An explicit global backend wins, matching the documented Docker mode."""
+def test_global_backend_overrides_default(tmp_path, monkeypatch):
+    """An explicit global backend opts into PostgreSQL; default is Parquet."""
     small = _sized_file(tmp_path, "small.csv", 1024)
     monkeypatch.setenv("PID_STORAGE_BACKEND", "postgres")
     assert pick_backend(small, "small.csv") == "postgres"

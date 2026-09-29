@@ -25,13 +25,24 @@
         <h3>数据集</h3><select id="datasetSelect"><option value="">选择数据集…</option></select><div id="datasetMeta" class="dataset-meta">请选择数据集</div>
       </section>
       <section class="card filters">
-        <h3>筛选</h3><label>年份<select id="yearSelect"></select></label><label>回路<select id="loopSelect"><option value="">全部回路</option></select></label>
-        <div class="check-title">变量</div><div class="checks"><label><input type="checkbox" value="PV" checked> PV</label><label><input type="checkbox" value="SV" checked> SV / SP</label><label><input type="checkbox" value="MV" checked> MV</label></div>
+        <h3>筛选</h3><label>年份<select id="yearSelect"></select></label><label>回路搜索<input id="loopSearch" type="search" placeholder="输入回路名称筛选…" /></label><div id="loopList" class="loop-list"></div><div id="loopHint" class="hint"></div>
+        <div class="check-title">变量</div><div class="checks"><label><input type="checkbox" value="PV" checked> PV</label><label><input type="checkbox" value="SV" checked> SV / SP</label><label><input type="checkbox" value="MV" checked> MV</label><label><input type="checkbox" value="OTHER" checked> 其他</label></div>
+        <label>信号搜索<input id="tagSearch" type="text" placeholder="按名称筛选信号…" /></label>
+        <div id="tagList" class="tag-list"></div>
+        <div id="tagHint" class="hint"></div>
+        <button id="clearTagSel" class="ghost full">清除手动选择（回到自动回路优选）</button>
       </section>
       <section class="card mapping-card">
         <h3>信号映射</h3><p class="muted">修正类型，并可保存单位和备注</p>
+        <label>查找信号<input id="mappingSearch" type="search" placeholder="输入信号名后编辑" /></label>
         <div id="signalMappingList" class="mapping-list"><span class="muted">请先选择数据集</span></div>
         <button id="saveSignalMappings" class="ghost full" disabled>保存映射</button>
+      </section>
+      <section class="card dup-card">
+        <h3>重复数据清理</h3><p class="muted">扫描内容相同的数据集，勾选后删除多余副本</p>
+        <button id="scanDupBtn" class="ghost full">扫描重复</button>
+        <div id="dupList" class="mapping-list"><span class="muted">尚未扫描</span></div>
+        <button id="deleteDupBtn" class="primary full" disabled>删除选中副本</button>
       </section>
     </aside>
 
@@ -43,7 +54,7 @@
         <section class="card"><div class="section-head"><h2>年度趋势</h2><span class="muted">每日平均 PV-SV 偏差与 MV 波动率</span></div><div id="yearChart" class="chart small-chart"></div></section>
       </div>
       <div id="dayView" class="hidden">
-        <div class="day-toolbar card"><label>日期<input id="dateInput" type="date" /></label><label>分辨率<select id="resolutionSelect"><option value="1m">1 分钟</option><option value="10s">10 秒</option><option value="raw">原始</option></select></label><button id="todayBtn" class="ghost">回到今天</button><button id="exportBtn" class="primary">导出当前视图</button></div>
+        <div class="day-toolbar card"><label>日期<input id="dateInput" type="date" /></label><label>分辨率<select id="resolutionSelect"><option value="1m">1 分钟</option><option value="10s">10 秒</option><option value="raw">原始</option></select></label><button id="todayBtn" class="ghost">回到最新数据日</button><button id="exportBtn" class="primary">导出当前视图</button></div>
         <div class="time-navigator card"><div class="time-navigator-head"><strong>日内时间窗口</strong><span id="windowLabel" class="muted">全天</span></div><div class="time-navigator-row"><span class="time-mark">00:00</span><input id="windowStartSlider" type="range" min="0" max="0" step="1" value="0" aria-label="窗口起始时间" /><span class="time-mark">24:00</span></div><div class="time-navigator-actions"><label>窗口长度<select id="windowDuration"><option value="1440">全天</option><option value="360">6 小时</option><option value="180">3 小时</option><option value="60">1 小时</option><option value="30">30 分钟</option><option value="15">15 分钟</option></select></label><button id="windowBack" class="ghost">上一窗口</button><button id="windowForward" class="ghost">下一窗口</button><button id="windowFull" class="ghost">显示全天</button></div></div>
         <section class="card"><div class="section-head"><h2 id="dayTitle">单日曲线</h2><span id="dayHint" class="muted"></span></div><div id="dayChart" class="chart day-chart"></div></section>
         <section class="card"><div class="section-head"><h2>智能分段</h2><div><span class="muted">点击分段查看区间统计</span> <button id="segmentExportBtn" class="ghost">导出分段</button></div></div><div id="segmentTimeline" class="timeline"></div><div id="segmentStats" class="segment-stats muted">请选择一个分段</div><div id="segmentTable" class="segment-table"></div></section>
@@ -51,6 +62,7 @@
       <div id="toast" class="toast"></div>
     </section>
   </main>
+  <script src="/static/loop-selection.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

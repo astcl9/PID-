@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-09-18T13:26:38",
+  "backend": "postgres",
+  "source_rows": 30000000,
+  "normalized_rows": 90000000,
+  "source_bytes": 1035000041,
+  "postgres_delta_bytes": 21232418816,
+  "generation_seconds": 0.0,
+  "import_seconds": 6845.383942,
+  "source_rows_per_second": 4382.52,
+  "normalized_rows_per_second": 13147.55,
+  "queries": {
+    "one_hour": {
+      "seconds": 5.570292,
+      "returned_points": 300
+    },
+    "one_day": {
+      "seconds": 80.479483,
+      "returned_points": 7200
+    }
+  },
+  "notes": "postgres_delta_bytes 为 pid_samples 表+索引总占用在本次导入前后的增量；未含源文件与 raw 副本。"
+}

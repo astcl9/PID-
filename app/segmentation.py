@@ -76,8 +76,10 @@ def segment_dataframe(df: pd.DataFrame, config=None, dataset_id="") -> list[dict
         elif len(err) >= 4 and mean_abs_error >= cfg["sustained_error"]: typ, reason, conf = "deviation", "PV-SV偏差持续偏大", .82
         elif len(err) >= 4 and np.std(err) > max(1, 2 * np.median(np.abs(err - np.median(err)))): typ, reason, conf = "oscillation", "PV-SV误差波动较大", .78
         elif std <= cfg["steady_std"]: typ, reason, conf = "steady", "PV波动较小", .88
-        stats = _segment_stats(part, a, b, typ)
-        segs.append({"id": uuid.uuid4().hex, "dataset_id": dataset_id, "start": a.to_pydatetime(), "end": b.to_pydatetime(), "type": typ, "confidence": float(conf), "reason": reason, "stats": stats})
+        # No stats here: the merge pass below extends/coalesces segments, and
+        # the final pass recomputes stats for every surviving segment anyway.
+        # Computing them per raw segment was pure waste (2x the slicing work).
+        segs.append({"id": uuid.uuid4().hex, "dataset_id": dataset_id, "start": a.to_pydatetime(), "end": b.to_pydatetime(), "type": typ, "confidence": float(conf), "reason": reason})
     # Coalesce noise fragments while preserving explicit data gaps.
     minimum = timedelta(minutes=int(cfg["min_segment_minutes"]))
     merged = []

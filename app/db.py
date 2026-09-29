@@ -53,6 +53,11 @@ def mark_backend(dataset_id: str, backend: str) -> None:
     _DATASET_BACKEND[str(dataset_id)] = str(backend)
 
 
+def clear_backend(dataset_id: str) -> None:
+    """Drop the in-memory size-router override, e.g. after dataset deletion."""
+    _DATASET_BACKEND.pop(str(dataset_id), None)
+
+
 def _env_backend() -> str:
     return os.getenv("PID_STORAGE_BACKEND", os.getenv("PID_STORAGE", "parquet")).strip().lower()
 
@@ -353,15 +358,15 @@ def postgres_configured() -> bool:
 
 
 def route_import(path: Path, dataset_id: str, filename: str, data_dir: Path, backend: str, progress=None, chunk_rows: int = 25000) -> dict:
-    """Import via the backend chosen by the size router."""
+    """Import via an explicitly chosen backend (opt-in; Parquet is the default)."""
     if backend in {"postgres", "postgresql"} and not postgres_configured():
         # Fail with an actionable message instead of a raw psycopg connection
-        # error, and never silently fall back to Parquet for a file whose size
-        # is exactly what the router decided PostgreSQL should handle.
+        # error, and never silently fall back to Parquet when the operator
+        # explicitly asked for PostgreSQL.
         raise ValueError(
-            "该文件超过大小路由阈值，需要 PostgreSQL 后端，但未检测到数据库配置。"
-            "请设置 PID_POSTGRES_PASSWORD（及 PID_POSTGRES_HOST/USER/DATABASE）"
-            "或调整 PID_LARGE_FILE_THRESHOLD_MB。"
+            "该导入显式选择了 PostgreSQL 后端，但未检测到数据库配置。"
+            "请设置 PID_POSTGRES_PASSWORD（及 PID_POSTGRES_HOST/USER/DATABASE），"
+            "或取消 PID_STORAGE_BACKEND 以使用默认的 Parquet 后端。"
         )
     mark_backend(dataset_id, backend)
     try:

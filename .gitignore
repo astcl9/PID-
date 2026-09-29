@@ -31,3 +31,7 @@ data/*.db
 clickhouse_data/
 clickhouse_logs/
 postgres_data/
+
+# Local planning and generated office documents
+WORKSPACE_STATUS.md
+docs/*.docx

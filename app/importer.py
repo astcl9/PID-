@@ -497,6 +497,7 @@ def import_dataset(path, dataset_id, filename, data_dir=None, progress=None, chu
                     "signals": [{"tag": str(t), "type": str(k)} for t, k in sigs],
                     "loops": sorted({str(t).rsplit('.', 1)[0] for t, _ in sigs if '.' in str(t)}),
                     "days": [str(d) for d in days], "day_summaries": day_summaries,
+                    "segment_summaries_ready": False,
                     # Recorded so the query layer can route this dataset back to
                     # Parquet after a restart, mirroring the PostgreSQL importer.
                     "storage": "parquet"}
@@ -517,4 +518,3 @@ def import_dataset(path, dataset_id, filename, data_dir=None, progress=None, chu
             except Exception: pass
         if not success:
             shutil.rmtree(root / "parquet" / dataset_id, ignore_errors=True)
-

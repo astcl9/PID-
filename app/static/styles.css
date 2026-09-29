@@ -10,3 +10,6 @@
 .cal-blank{min-height:38px}
 @media(max-width:1100px){.calendar{grid-template-columns:repeat(2,minmax(240px,1fr))}}
 @media(max-width:900px){.calendar{grid-template-columns:1fr}}
+.dup-group{padding:8px 0;border-bottom:1px solid var(--line)}.dup-row{display:flex;gap:8px;align-items:center;padding:4px 0;font-size:12px}.dup-row .muted{font-size:11px}
+.tag-list,.loop-list{max-height:160px;overflow:auto;border:1px solid var(--line);border-radius:7px;margin:8px 0;padding:4px 8px}.tag-row,.loop-row{display:flex;gap:6px;align-items:center;font-size:11px;padding:2px 0}.tag-row span,.loop-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}.tag-row small{color:#8a94a6}.loop-row{width:100%;margin:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer}.loop-row:hover{background:#f5f8fc;border-radius:4px}.loop-row.selected{color:var(--accent);font-weight:600;background:#eef4ff;border-radius:4px}.hint{color:var(--muted);font-size:11px;margin:4px 0}
+.tag-select-all{display:flex;gap:6px;align-items:center;font-weight:600;border-bottom:1px solid var(--line);padding:3px 0 6px;margin:0 0 4px;font-size:11px}

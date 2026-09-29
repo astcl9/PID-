@@ -7,6 +7,8 @@ import itertools
 import json
 import os
 import shutil
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
@@ -14,19 +16,96 @@ import pandas as pd
 TABLE = "pid_samples"
 
 
+def _connect_kwargs():
+    dsn = os.getenv("PID_POSTGRES_DSN")
+    if dsn:
+        return {"conninfo": dsn}
+    return {"host": os.getenv("PID_POSTGRES_HOST", "127.0.0.1"),
+            "port": int(os.getenv("PID_POSTGRES_PORT", "5432")),
+            "dbname": os.getenv("PID_POSTGRES_DATABASE", "pid"),
+            "user": os.getenv("PID_POSTGRES_USER", "postgres"),
+            "password": os.getenv("PID_POSTGRES_PASSWORD", "")}
+
+
 def connect():
     try:
         import psycopg
     except ImportError as exc:
         raise RuntimeError("PostgreSQL 模式需要安装 psycopg[binary]：python -m pip install 'psycopg[binary]>=3.2'") from exc
-    dsn = os.getenv("PID_POSTGRES_DSN")
-    if dsn:
-        return psycopg.connect(dsn)
-    return psycopg.connect(host=os.getenv("PID_POSTGRES_HOST", "127.0.0.1"),
-                           port=int(os.getenv("PID_POSTGRES_PORT", "5432")),
-                           dbname=os.getenv("PID_POSTGRES_DATABASE", "pid"),
-                           user=os.getenv("PID_POSTGRES_USER", "postgres"),
-                           password=os.getenv("PID_POSTGRES_PASSWORD", ""))
+    return psycopg.connect(**_connect_kwargs())
+
+
+class _SimplePool:
+    """Minimal LIFO connection pool used when psycopg_pool is not installed.
+
+    psycopg connections must not be shared by threads concurrently, so checkouts
+    are exclusive. Returned connections are rolled back (clearing any aborted
+    transaction) before reuse; broken connections are dropped.
+    """
+
+    def __init__(self, max_size: int = 4, factory=None):
+        self._idle: list = []
+        self._lock = threading.Lock()
+        self._max = max(1, int(max_size))
+        self._factory = factory or connect
+
+    @contextmanager
+    def connection(self):
+        conn = None
+        with self._lock:
+            if self._idle:
+                conn = self._idle.pop()
+        if conn is None:
+            conn = self._factory()
+        try:
+            yield conn
+        finally:
+            try:
+                if conn.closed:
+                    return
+                if conn.info.transaction_status != 0:  # idle (no open transaction)
+                    conn.rollback()
+            except Exception:
+                try: conn.close()
+                except Exception: pass
+                return
+            with self._lock:
+                if len(self._idle) < self._max:
+                    self._idle.append(conn)
+                    conn = None
+            if conn is not None:
+                conn.close()
+
+
+_POOL = None
+_POOL_LOCK = threading.Lock()
+
+
+def _pool():
+    """Process-wide pool; prefers psycopg_pool when installed, else the
+    built-in simple pool. Every read path re-used a fresh TCP+auth handshake
+    per query, which dominated bucketed chart queries on high-latency links."""
+    global _POOL
+    if _POOL is None:
+        with _POOL_LOCK:
+            if _POOL is None:
+                max_size = int(os.getenv("PID_POSTGRES_POOL_SIZE", "4"))
+                try:
+                    from psycopg_pool import ConnectionPool
+                    kwargs = _connect_kwargs()
+                    conninfo = kwargs.pop("conninfo", "")
+                    _POOL = ConnectionPool(conninfo=conninfo, kwargs=kwargs or None,
+                                           min_size=1, max_size=max_size, open=True)
+                except ImportError:
+                    _POOL = _SimplePool(max_size)
+    return _POOL
+
+
+@contextmanager
+def _connection():
+    pool = _pool()
+    with pool.connection() as conn:
+        yield conn
 
 
 def ensure_schema(conn=None):
@@ -59,32 +138,58 @@ def _where(dataset_id, start=None, end=None, tags=None):
     return " AND ".join(clauses), params
 
 
+_COPY_SPECIAL = ("\t", "\n", "\r", "\\")
+
+
+def _copy_escape(value) -> str:
+    """Escape one field for the COPY text format (tab-separated, \\N = NULL)."""
+    text = str(value)
+    if not any(c in text for c in _COPY_SPECIAL):
+        return text
+    return (text.replace("\\", "\\\\").replace("\t", "\\t")
+                .replace("\n", "\\n").replace("\r", "\\r"))
+
+
+def _copy_buffer(frame) -> bytes:
+    """Serialise a normalised batch to the COPY text format in one buffer."""
+    dataset = str(frame["dataset_id"].iat[0])
+    stamps = pd.DatetimeIndex(frame["timestamp"])
+    stamps = stamps.tz_localize("Asia/Shanghai") if stamps.tz is None else stamps.tz_convert("Asia/Shanghai")
+    ts_text = stamps.strftime("%Y-%m-%d %H:%M:%S%z")  # +0800 offset, PG-valid
+    tags = frame["tag"].tolist()
+    types = frame["type"].tolist()
+    vals = frame["value"].to_numpy(dtype="float64")
+    value_missing = frame["value"].isna().to_numpy()
+    quals = frame["quality"].tolist()
+    units = frame["unit"].tolist()
+    unit_missing = frame["unit"].isna().to_numpy()
+    seqs = frame["_ingest_seq"].to_numpy(dtype="int64")
+    lines = [
+        "\t".join((
+            dataset,
+            ts_text[i],
+            _copy_escape(tags[i]),
+            _copy_escape(types[i]),
+            "\\N" if value_missing[i] else repr(float(vals[i])),
+            _copy_escape(quals[i]),
+            "\\N" if unit_missing[i] else _copy_escape(units[i]),
+            str(int(seqs[i])),
+        ))
+        for i in range(len(frame))
+    ]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def insert_batch(conn, frame):
     if frame.empty: return 0
     with conn.cursor() as cur:
         cur.execute("CREATE TEMP TABLE IF NOT EXISTS pid_import_stage (dataset_id text,timestamp timestamptz,tag text,type text,value double precision,quality text,unit text,ingest_seq bigint) ON COMMIT PRESERVE ROWS")
         cur.execute("TRUNCATE pid_import_stage")
-        # Serialize the COPY text from pre-built numpy arrays instead of
-        # itertuples + per-row local_ts().  Timestamps are localized once for
-        # the whole column and nulls are computed with vectorized masks; the
-        # remaining per-row work is just index lookups.  ~2x faster on 300k rows.
-        dataset = str(frame["dataset_id"].iat[0])
-        stamps = pd.DatetimeIndex(frame["timestamp"])
-        stamps = stamps.tz_localize("Asia/Shanghai") if stamps.tz is None else stamps.tz_convert("Asia/Shanghai")
-        stamps = stamps.to_pydatetime()
-        tags = frame["tag"].to_numpy()
-        types = frame["type"].to_numpy()
-        vals = frame["value"].to_numpy(dtype="float64")
-        value_missing = frame["value"].isna().to_numpy()
-        quals = frame["quality"].to_numpy()
-        units = frame["unit"].to_numpy()
-        unit_missing = frame["unit"].isna().to_numpy()
-        seqs = frame["_ingest_seq"].to_numpy(dtype="int64")
+        # One bulk write() of a pre-serialised buffer instead of per-row
+        # write_row: every write_row pays psycopg's per-row adaptation
+        # overhead, which dominated on wide imports (~300k rows).
         with cur.copy("COPY pid_import_stage (dataset_id,timestamp,tag,type,value,quality,unit,ingest_seq) FROM STDIN") as copy:
-            for i in range(len(frame)):
-                copy.write_row((dataset, stamps[i], str(tags[i]), str(types[i]),
-                                None if value_missing[i] else vals[i], str(quals[i]),
-                                None if unit_missing[i] else str(units[i]), int(seqs[i])))
+            copy.write(_copy_buffer(frame))
         cur.execute(f"""INSERT INTO {TABLE}(dataset_id,timestamp,tag,type,value,quality,unit,ingest_seq)
           SELECT DISTINCT ON(dataset_id,tag,timestamp) dataset_id,timestamp,tag,type,value,quality,unit,ingest_seq
           FROM pid_import_stage ORDER BY dataset_id,tag,timestamp,ingest_seq DESC
@@ -139,18 +244,15 @@ def import_file(path, dataset_id, filename, data_dir, progress=None, chunk_rows=
 
 
 def query_frame(dataset_id, start=None, end=None, tags=None):
-    conn=connect()
-    try:
+    with _connection() as conn:
         where,params=_where(dataset_id,start,end,tags)
         with conn.cursor() as cur: cur.execute(f"SELECT dataset_id,timestamp,tag,type,value,quality,unit FROM {TABLE} WHERE {where} ORDER BY timestamp,tag",params); rows=cur.fetchall()
         return pd.DataFrame(rows,columns=["dataset_id","timestamp","tag","type","value","quality","unit"])
-    finally: conn.close()
 
 
 def query_buckets(dataset_id,start,end,tags=None,seconds=60):
     if int(seconds) not in {10,60,600,3600}: raise ValueError("不支持的聚合间隔")
-    conn=connect()
-    try:
+    with _connection() as conn:
         where,params=_where(dataset_id,start,end,tags); origin=local_ts(start); sec=int(seconds)
         sql=f"""WITH b AS (SELECT *,date_bin(make_interval(secs=>%s),timestamp,%s) bucket FROM {TABLE} WHERE {where} AND value IS NOT NULL)
           SELECT tag,type,bucket,(array_agg(timestamp ORDER BY value))[1],min(value),(array_agg(timestamp ORDER BY value DESC))[1],max(value) FROM b GROUP BY tag,type,bucket ORDER BY tag,bucket"""
@@ -160,31 +262,36 @@ def query_buckets(dataset_id,start,end,tags=None,seconds=60):
             out.append({"timestamp":mint,"tag":tag,"type":typ,"value":minv})
             if maxt!=mint: out.append({"timestamp":maxt,"tag":tag,"type":typ,"value":maxv})
         return pd.DataFrame(out,columns=["timestamp","tag","type","value"])
-    finally: conn.close()
 
 
 def csv_stream(dataset_id,start,end,tags=None):
-    conn=connect()
-    try:
+    with _connection() as conn:
         where,params=_where(dataset_id,start,end,tags)
         with conn.cursor() as cur:
             cur.execute(f"SELECT dataset_id,timestamp,tag,type,value,quality,unit FROM {TABLE} WHERE {where} ORDER BY tag,timestamp",params)
             yield "dataset_id,timestamp,tag,type,value,quality,unit\n"
             while rows:=cur.fetchmany(5000):
                 out=io.StringIO(); csv.writer(out,lineterminator="\n").writerows(rows); yield out.getvalue()
-    finally: conn.close()
 
 
 def daily_summary(dataset_id):
-    conn=connect()
-    try:
+    with _connection() as conn:
         with conn.cursor() as cur:
             cur.execute(f"SELECT to_char(timestamp AT TIME ZONE 'Asia/Shanghai','YYYY-MM-DD'),tag,type,count(value),avg(value),min(value),max(value) FROM {TABLE} WHERE dataset_id=%s GROUP BY 1,tag,type ORDER BY 1,tag",[str(dataset_id)])
             return [dict(zip(["day","tag","type","count","mean","min","max"],r)) for r in cur.fetchall()]
-    finally: conn.close()
+
+
+def delete_dataset(dataset_id: str) -> int:
+    """Remove every sample row for one dataset; returns rows deleted."""
+    with _connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {TABLE} WHERE dataset_id=%s", [str(dataset_id)])
+            return int(cur.rowcount or 0)
 
 
 def ping():
     try:
-        conn=connect(); conn.close(); return True
+        with _connection() as conn:
+            conn.execute("SELECT 1")
+        return True
     except Exception: return False

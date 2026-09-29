@@ -10,12 +10,15 @@ import logging
 import os
 import shutil
 import pandas as pd
+from pydantic import BaseModel
 from .config import DATA_DIR, MAX_UPLOAD_MB
 from .jobs import create_job, get_job, job_summary, pick_backend
 from uuid import uuid4
-from .storage import list_meta, load_frame, update_signal_metadata, csv_stream
-from .query import query_data
+from . import fingerprint as content_fp
+from .storage import list_meta, load_frame, update_signal_metadata, csv_stream, cache_day_summaries
+from .query import query_data, query_frame, _iso_milliseconds
 from .segmentation import segment_dataframe
+from . import segment_store
 from .models import (
     DataResponse,
     DatasetInfo,
@@ -34,28 +37,6 @@ logger = logging.getLogger(__name__)
 SEGMENT_CACHE_MAX = int(os.getenv("PID_SEGMENT_CACHE_MAX", "32"))
 SEGMENTS: dict[str, list[dict]] = {}
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
-
-
-def _segment_store_path(dataset_id: str) -> Path:
-    path = DATA_DIR / "segments"
-    path.mkdir(parents=True, exist_ok=True)
-    return path / f"{dataset_id}.json"
-
-
-def _read_segment_store(dataset_id: str) -> dict[str, list[dict]]:
-    path = _segment_store_path(dataset_id)
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except (ValueError, OSError, TypeError):
-        return {}
-
-
-def _write_segment_store(dataset_id: str, store: dict[str, list[dict]]) -> None:
-    path = _segment_store_path(dataset_id)
-    path.write_text(json.dumps(store, default=str, ensure_ascii=False), encoding="utf-8")
 
 
 def _cache_get(key: str) -> list[dict] | None:
@@ -185,7 +166,8 @@ async def upload_dataset(file: UploadFile = File(...)):
                 raise HTTPException(413, "文件超过大小限制")
             out.write(chunk)
     backend = pick_backend(temp, file.filename or temp.name)
-    job_id = create_job(temp, dataset_id, file.filename or temp.name, backend=backend)
+    fingerprint = content_fp.file_fingerprint(temp, file.filename or temp.name)
+    job_id = create_job(temp, dataset_id, file.filename or temp.name, backend=backend, fingerprint=fingerprint)
     logger.info("accepted upload filename=%s dataset_id=%s job_id=%s bytes=%s", file.filename, dataset_id, job_id, size)
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": "queued"})
 
@@ -196,7 +178,96 @@ def import_status(job_id: str):
     return job
 
 @app.get("/api/datasets", response_model=list[DatasetInfo])
-def datasets(): return list_meta()
+def datasets():
+    # Keep the picker response small for datasets with thousands of signals.
+    # Full signal metadata is loaded only after a dataset is selected.
+    result = []
+    for item in list_meta():
+        signals = item.get("signals") or []
+        result.append({
+            key: item.get(key)
+            for key in ("id", "name", "start_time", "end_time", "rows", "warnings", "loops")
+            if key in item
+        } | {"signal_count": len(signals), "signals": []})
+    return result
+
+
+class DatasetCheckRequest(BaseModel):
+    name: str
+    size: int
+    head_sha256: str
+
+
+def _metas_with_legacy_sizes() -> list[dict]:
+    """Datasets imported before fingerprinting have no source_size in their
+    metadata; recover it from the preserved raw copy so name+size matching
+    still flags them as duplicates."""
+    metas = list_meta()
+    for meta in metas:
+        if meta.get("fingerprint") or meta.get("source_size") is not None:
+            continue
+        raw_dir = DATA_DIR / "raw" / str(meta.get("id"))
+        try:
+            files = list(raw_dir.glob("*"))
+        except OSError:
+            files = []
+        if files:
+            meta["source_size"] = files[0].stat().st_size
+    return metas
+
+
+@app.post("/api/datasets/check")
+def check_dataset(payload: DatasetCheckRequest):
+    """Pre-upload duplicate check: same content fingerprint or, for datasets
+    imported before fingerprinting, same original filename + size."""
+    matches = content_fp.find_matches(_metas_with_legacy_sizes(), {"filename": payload.name, "size": payload.size,
+                                                                    "head_sha256": payload.head_sha256})
+    return {"duplicate": bool(matches),
+            "matches": [{"id": m.get("id"), "name": m.get("name"), "rows": m.get("rows"),
+                         "start_time": m.get("start_time"), "end_time": m.get("end_time")} for m in matches]}
+
+
+@app.get("/api/duplicates")
+def duplicates():
+    """Groups of datasets that look identical (same fingerprint or, for legacy
+    imports, same original filename + size).  Frontend offers per-group cleanup."""
+    groups = content_fp.duplicate_groups(_metas_with_legacy_sizes())
+    return [{"key": str(index),
+             "datasets": [{"id": m.get("id"), "name": m.get("name"), "rows": m.get("rows"),
+                           "start_time": m.get("start_time"), "end_time": m.get("end_time"),
+                           "storage": m.get("storage")} for m in group]}
+            for index, group in enumerate(groups)]
+
+
+@app.delete("/api/datasets/{dataset_id}")
+def delete_dataset(dataset_id: str, confirm: bool = False):
+    """Delete a dataset and all of its storage (raw copy, day partitions,
+    segment cache, database rows).  Destructive: requires confirm=true."""
+    if not confirm:
+        raise HTTPException(400, "删除操作不可逆，请带 confirm=true 明确确认")
+    metadata = next((item for item in list_meta() if item.get("id") == dataset_id), None)
+    if metadata is None:
+        raise HTTPException(404, "数据集不存在")
+    from . import db
+    backend = db.dataset_backend(dataset_id)
+    if backend == "clickhouse":
+        raise HTTPException(400, "暂不支持删除 ClickHouse 数据集，请手动清理")
+    deleted_rows = 0
+    if db.dataset_uses_postgres(dataset_id):
+        from . import postgres_db
+        deleted_rows = postgres_db.delete_dataset(dataset_id)
+    for path in (DATA_DIR / "meta" / f"{dataset_id}.json",
+                 DATA_DIR / "segments" / f"{dataset_id}.json"):
+        path.unlink(missing_ok=True)
+    segment_store.delete_dataset(DATA_DIR / "segments", dataset_id)
+    for directory in (DATA_DIR / "raw" / dataset_id, DATA_DIR / "parquet" / dataset_id):
+        if directory.exists():
+            shutil.rmtree(directory, ignore_errors=True)
+    for key in [key for key in list(SEGMENTS) if key == dataset_id or key.startswith(f"{dataset_id}:")]:
+        del SEGMENTS[key]
+    db.clear_backend(dataset_id)
+    logger.info("deleted dataset_id=%s backend=%s db_rows=%s", dataset_id, backend, deleted_rows)
+    return {"deleted": dataset_id, "backend": backend, "db_rows": deleted_rows}
 
 @app.get("/api/datasets/{dataset_id}/signals", response_model=list[SignalInfo])
 def signals(dataset_id: str):
@@ -224,7 +295,31 @@ def days(dataset_id: str):
         # Import jobs publish day partitions only after completion. Returning the
         # cached calendar avoids scanning a full year merely to paint the grid.
         if isinstance(cached_days[0], str):
-            return [{"date": day, "coverage": 1.0, "segmentCount": 0, "alarmCount": 0, "score": 0} for day in cached_days]
+            # Legacy imports only stored date strings. Treat that as an
+            # uncomputed summary so the annual view does not permanently show
+            # zero segments after the first request.
+            metadata = dict(metadata)
+            metadata["segment_summaries_ready"] = False
+            cached_days = None
+        # Older imports published day summaries before segmentation was run and
+        # therefore stored segmentCount=0 for every day. Upgrade that cache on
+        # the first calendar request so the annual view agrees with /api/segments.
+        if metadata.get("segment_summaries_ready") is not True:
+            df = load_frame(dataset_id)
+            if df.empty:
+                return []
+            result = []
+            df["day"] = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m-%d")
+            for day, part in df.groupby("day"):
+                part = _apply_signal_types(part, dataset_id)
+                timestamps = pd.to_datetime(part["timestamp"]).drop_duplicates().sort_values()
+                expected = max(1, int((timestamps.iloc[-1] - timestamps.iloc[0]).total_seconds() / 60) + 1) if len(timestamps) else 1
+                coverage = min(1.0, len(timestamps) / expected)
+                segs = _segments_for_frame(part.drop(columns=["day"]), dataset_id=dataset_id)
+                result.append({"date": day, "coverage": coverage, "segmentCount": len(segs), "alarmCount": 0,
+                               "score": round(max(0.0, 100.0 - float(part["value"].dropna().std() or 0)), 2)})
+            cache_day_summaries(dataset_id, result)
+            return result
         return cached_days
     df = load_frame(dataset_id)
     if df.empty: return []
@@ -235,27 +330,35 @@ def days(dataset_id: str):
         timestamps = pd.to_datetime(part["timestamp"]).drop_duplicates().sort_values()
         expected = max(1, int((timestamps.iloc[-1] - timestamps.iloc[0]).total_seconds() / 60) + 1) if len(timestamps) else 1
         coverage = min(1.0, len(timestamps) / expected)
-        segs = segment_dataframe(part.drop(columns=["day"]), dataset_id=dataset_id)
+        segs = _segments_for_frame(part.drop(columns=["day"]), dataset_id=dataset_id)
         result.append({"date": day, "coverage": coverage, "segmentCount": len(segs), "alarmCount": 0,
                        "score": round(max(0.0, 100.0 - float(part["value"].dropna().std() or 0)), 2)})
+    # The fallback runs a full-dataset scan plus per-day segmentation; persist
+    # it so only the first request pays that cost (see storage.cache_day_summaries).
+    cache_day_summaries(dataset_id, result)
     return result
 
 @app.get("/api/data", response_model=DataResponse)
 def data(dataset_id: str, start: str, end: str, tags: str | None = None, resolution: str = "auto", loop: str | None = None):
     start, end = _validate_window(start, end)
-    payload = query_data(dataset_id, start, end, tags.split(",") if tags else None, resolution)
-    rows = payload.get("rows", [])
+    tag_list = tags.split(",") if tags else None
+    actual_resolution, frame = query_frame(dataset_id, start, end, tags=tag_list, resolution=resolution)
+    if frame.empty:
+        return {"resolution": actual_resolution, "series": []}
     type_mapping = _signal_type_map(dataset_id)
-    for row in rows:
-        row["type"] = type_mapping.get(str(row.get("tag")), row.get("type", "other"))
+    if type_mapping:
+        frame["type"] = frame["tag"].astype(str).map(type_mapping).fillna(frame["type"])
     if loop:
-        rows = [r for r in rows if str(r.get("tag", "")).startswith(f"{loop}.")]
-    grouped = {}
-    for row in rows:
-        key = row.get("tag")
-        grouped.setdefault(key, {"name": key, "type": row.get("type", "other").upper(), "x": [], "y": []})
-        grouped[key]["x"].append(row.get("timestamp")); grouped[key]["y"].append(row.get("value"))
-    return {"resolution": payload.get("resolution", resolution), "series": list(grouped.values())}
+        frame = frame[frame["tag"].astype(str).str.startswith(f"{loop}.")]
+    frame = frame.copy()
+    frame["timestamp"] = _iso_milliseconds(pd.to_datetime(frame["timestamp"]))
+    series = [
+        {"name": name, "type": str(part["type"].iloc[0]).upper(),
+         "x": part["timestamp"].tolist(),
+         "y": part["value"].where(pd.notna(part["value"]), None).tolist()}
+        for name, part in frame.groupby("tag", sort=False)
+    ]
+    return {"resolution": actual_resolution, "series": series}
 
 @app.get("/api/segments", response_model=list[Segment])
 def segments(dataset_id: str, start: str | None = None, end: str | None = None, date: str | None = None,
@@ -272,9 +375,10 @@ def segments(dataset_id: str, start: str | None = None, end: str | None = None, 
     key = f"{dataset_id}:{start}:{end}:{loop or ''}"
     result = None if recompute else _cache_get(key)
     if result is None:
-        stored = _read_segment_store(dataset_id)
-        if not recompute and key in stored:
-            result = stored[key]
+        store_dir = DATA_DIR / "segments"
+        stored = None if recompute else segment_store.get(store_dir, dataset_id, key)
+        if stored is not None:
+            result = stored
             _cache_put(key, result)
         else:
             # Segmentation only needs 1-minute resolution, so query bucketed
@@ -288,8 +392,7 @@ def segments(dataset_id: str, start: str | None = None, end: str | None = None, 
             frame = _apply_signal_types(frame, dataset_id)
             result = _segments_for_frame(frame, dataset_id=dataset_id, loop=loop)
             _cache_put(key, result)
-            stored[key] = result
-            _write_segment_store(dataset_id, stored)
+            segment_store.put(store_dir, dataset_id, key, result)
     logger.info("served segments dataset_id=%s loop=%s start=%s end=%s count=%s", dataset_id, loop, start, end, len(result))
     return result
 
@@ -318,29 +421,23 @@ def update_segment(segment_id: str, type: str | None = None, start: str | None =
         raise HTTPException(400, "没有提供任何修改字段")
     # Manual corrections are persisted per dataset, so a PATCH must find the
     # segment on disk rather than only in the in-memory SEGMENTS cache.  This
-    # makes edits survive a service restart.
-    segments_dir = DATA_DIR / "segments"
-    if not segments_dir.exists():
+    # makes edits survive a service restart. The SQLite store indexes rows by
+    # segment id, so this is a single indexed lookup instead of scanning every
+    # dataset's store.
+    store_dir = DATA_DIR / "segments"
+    found = segment_store.find(store_dir, segment_id)
+    if found is None:
         raise HTTPException(404, "分段不存在")
-    for store_path in sorted(segments_dir.glob("*.json")):
-        dataset_id = store_path.stem
-        stored = _read_segment_store(dataset_id)
-        for key, items in stored.items():
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if item.get("id") != segment_id:
-                    continue
-                if type: item["type"] = type
-                if start: item["start"] = start
-                if end: item["end"] = end
-                if note is not None: item["note"] = note
-                item["manual_override"] = True
-                _write_segment_store(dataset_id, stored)
-                # Keep the in-memory cache in sync when it was already populated.
-                _cache_put(key, items)
-                return item
-    raise HTTPException(404, "分段不存在")
+    dataset_id, key, item = found
+    if type: item["type"] = type
+    if start: item["start"] = start
+    if end: item["end"] = end
+    if note is not None: item["note"] = note
+    item["manual_override"] = True
+    segment_store.save_item(store_dir, dataset_id, key, item)
+    # Keep the in-memory cache in sync when it was already populated.
+    _cache_put(key, segment_store.items_for_key(store_dir, dataset_id, key))
+    return item
 
 @app.get("/api/export")
 def export_data(dataset_id: str, date: str, loop: str | None = None, start: str | None = None, end: str | None = None):
@@ -362,4 +459,3 @@ def export_data(dataset_id: str, date: str, loop: str | None = None, start: str 
 def datePlus(date: str) -> str:
     value = pd.Timestamp(date) + pd.Timedelta(days=1)
     return value.strftime("%Y-%m-%d")
-

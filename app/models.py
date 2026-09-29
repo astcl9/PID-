@@ -26,6 +26,8 @@ class DatasetInfo(BaseModel):
     end_time: Optional[datetime] = None
     rows: int = 0
     signals: list[SignalInfo] = Field(default_factory=list)
+    signal_count: int = 0
+    loops: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 class Segment(BaseModel):

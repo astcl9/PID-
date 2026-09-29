@@ -10,7 +10,7 @@ import sqlite3
 from threading import Lock
 from uuid import uuid4
 
-from .config import DATA_DIR, IMPORT_WORKERS, LARGE_FILE_THRESHOLD_MB
+from .config import DATA_DIR, IMPORT_WORKERS
 from .importer import import_dataset, import_parquet_only
 
 # Concurrent imports share bounded per-chunk buffers, but the cross-chunk
@@ -81,25 +81,26 @@ def job_summary() -> dict[str, int]:
     return counts
 
 def pick_backend(path: Path, filename: str) -> str:
-    """Size router: CSV >= threshold -> PostgreSQL; everything else -> Parquet.
+    """Resolve the import backend.
 
-    An explicit global ``PID_STORAGE_BACKEND`` wins, which is what the Docker
-    guide documents ("all imports go to PostgreSQL").  Size routing only decides
-    the backend for the default mixed deployment where the global value is
-    Parquet.
+    Parquet is the only production backend: the 2026-09-18 1 GB benchmark
+    (docs/benchmark-1gb-*.json) showed PostgreSQL imports 8x slower, uses 32x
+    more disk, and its all-day query takes 80 s vs 0.13 s. PostgreSQL remains
+    available as an explicit opt-in experiment via PID_STORAGE_BACKEND=postgres
+    (or PID_STORAGE); there is no automatic size-based routing.
     """
     configured = os.getenv("PID_STORAGE_BACKEND", os.getenv("PID_STORAGE", "parquet")).strip().lower()
     if configured in {"postgres", "postgresql", "clickhouse"}:
         return configured
-    if Path(filename or path.name).suffix.lower() == ".csv" and path.stat().st_size >= LARGE_FILE_THRESHOLD_MB * 1024 * 1024:
-        return "postgres"
     return "parquet"
 
 
-def create_job(path: Path, dataset_id: str, filename: str, backend: str | None = None) -> str:
+def create_job(path: Path, dataset_id: str, filename: str, backend: str | None = None,
+               fingerprint: dict | None = None) -> str:
     job_id = uuid4().hex
     with _lock:
         _jobs[job_id] = {"job_id": job_id, "status": "queued", "progress": 0, "backend": backend,
+                         "fingerprint": fingerprint,
                          "rows_processed": 0, "bytes_processed": 0,
                          "total_bytes": path.stat().st_size, "filename": filename,
                          "created_at": _now()}
@@ -125,6 +126,19 @@ def _run(job_id, path, dataset_id, filename, backend=None):
             metadata = import_parquet_only(path, dataset_id, filename, data_dir=DATA_DIR, progress=progress)
         else:
             metadata = import_dataset(path, dataset_id, filename, data_dir=DATA_DIR, progress=progress)
+        # Attach the upload-time content fingerprint to the persisted metadata
+        # so future uploads of the same file can be flagged as duplicates.
+        fingerprint = _jobs.get(job_id, {}).get("fingerprint")
+        if fingerprint and isinstance(metadata, dict):
+            metadata = dict(metadata)
+            metadata["fingerprint"] = fingerprint
+            metadata.setdefault("source_name", filename)
+            metadata.setdefault("source_size", fingerprint.get("size"))
+            meta_path = DATA_DIR / "meta" / f"{dataset_id}.json"
+            try:
+                meta_path.write_text(json.dumps(metadata, default=str, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                pass
         with _lock:
             _jobs[job_id].update({"status": "completed", "progress": 1, "metadata": metadata, "updated_at": _now()})
             _persist_job(_jobs[job_id])
